@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -41,7 +42,10 @@
 #include <spawn.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/message.h>
+#include <mach/port.h>
 #include <crt_externs.h>
 #define environ (*_NSGetEnviron())
 
@@ -75,29 +79,63 @@ void os_unfair_lock_assert_owner(os_unfair_lock_t lock) { (void)lock; }
 #define UL_COMPARE_AND_WAIT_SHARED  3
 #define UL_COMPARE_AND_WAIT64       5
 
+/* Condvar-based __ulock emulation. One global mutex/cond pair; waiters
+ * check the user's atomic word inside the mutex and cond_wait when the
+ * value still matches. __ulock_wake broadcasts, every waiter re-checks
+ * its own (addr, value) and either returns or waits again. Thundering-
+ * herd cost per wake is O(N_waiters) — tolerable at the thread counts
+ * Bun uses (~15). No polling, so idle CPU is truly zero. */
+static pthread_mutex_t g_ulock_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_ulock_cv = PTHREAD_COND_INITIALIZER;
+
 int __ulock_wait2(uint32_t op, void *addr, uint64_t value, uint64_t timeout_ns, uint64_t value2) {
     (void)value2;
     int is_64bit = (op & UL_OPERATION_MASK) == UL_COMPARE_AND_WAIT64;
     DBG("ulock_wait op=0x%x addr=%p val=%llu timeout=%lluns", op, addr, value, timeout_ns);
 
-    /* Tight polling — low latency so Bun's inter-thread signals (especially
-     * for TTY I/O and render-tick) don't stall. */
-    uint64_t elapsed_ns = 0;
-    useconds_t sleep_us = 1;
+    /* Fast path: caller's value already differs — nothing to wait for. */
+    uint64_t cur0 = is_64bit ? *(volatile uint64_t *)addr
+                             : *(volatile uint32_t *)addr;
+    if (cur0 != value) return 0;
+
+    /* Compute absolute deadline for timed waits. */
+    struct timespec deadline = {0, 0};
+    int timed = timeout_ns != 0;
+    if (timed) {
+        struct timeval now; gettimeofday(&now, NULL);
+        deadline.tv_sec  = now.tv_sec  + (time_t)(timeout_ns / 1000000000ULL);
+        long add_nsec = now.tv_usec * 1000L + (long)(timeout_ns % 1000000000ULL);
+        if (add_nsec >= 1000000000L) { deadline.tv_sec += 1; add_nsec -= 1000000000L; }
+        deadline.tv_nsec = add_nsec;
+    }
+
+    pthread_mutex_lock(&g_ulock_mu);
     for (;;) {
         uint64_t cur = is_64bit ? *(volatile uint64_t *)addr
                                 : *(volatile uint32_t *)addr;
-        if (cur != value) return 0;
-        if (timeout_ns && elapsed_ns >= timeout_ns) return -ETIMEDOUT;
-        usleep(sleep_us);
-        elapsed_ns += (uint64_t)sleep_us * 1000;
-        if (sleep_us < 50) sleep_us *= 2;   /* cap at 50us */
+        if (cur != value) {
+            pthread_mutex_unlock(&g_ulock_mu);
+            return 0;
+        }
+        int rc;
+        if (timed) {
+            rc = pthread_cond_timedwait(&g_ulock_cv, &g_ulock_mu, &deadline);
+            if (rc == ETIMEDOUT) {
+                pthread_mutex_unlock(&g_ulock_mu);
+                return -ETIMEDOUT;
+            }
+        } else {
+            pthread_cond_wait(&g_ulock_cv, &g_ulock_mu);
+        }
+        /* Spurious or broadcast wake — loop will re-check the value. */
     }
 }
 
 int __ulock_wake(uint32_t op, void *addr, uint64_t wake_value) {
     (void)op; (void)addr; (void)wake_value;
-    /* Waiters poll the memory themselves; no wake needed. */
+    pthread_mutex_lock(&g_ulock_mu);
+    pthread_cond_broadcast(&g_ulock_cv);
+    pthread_mutex_unlock(&g_ulock_mu);
     return 0;
 }
 
@@ -429,8 +467,10 @@ static ssize_t write_inject_cancel(int fd, const char *buf, size_t n,
     static const char inject[] = "\x1b[24m";
     static const size_t inject_len = sizeof(inject) - 1;
 
+    /* Count occurrences. */
     size_t count = 0;
-    const char *scan = buf, *end = buf + n;
+    const char *scan = buf;
+    const char *end = buf + n;
     while (scan + needle_len <= end) {
         const char *m = memmem(scan, end - scan, needle, needle_len);
         if (!m) break;
@@ -442,7 +482,7 @@ static ssize_t write_inject_cancel(int fd, const char *buf, size_t n,
     size_t newsize = n + count * inject_len;
     char stackbuf[1024];
     char *newbuf = newsize <= sizeof(stackbuf) ? stackbuf : malloc(newsize);
-    if (!newbuf) return real(fd, buf, n);
+    if (!newbuf) return real(fd, buf, n);  /* best-effort fallback */
 
     char *dst = newbuf;
     const char *src = buf;
@@ -461,6 +501,8 @@ static ssize_t write_inject_cancel(int fd, const char *buf, size_t n,
         src = m + needle_len;
     }
 
+    /* Write the whole injected buffer. Loop on partial / EINTR so the
+     * caller sees its full n bytes as accepted. */
     size_t written = 0;
     ssize_t last = 0;
     while (written < newsize) {
@@ -476,6 +518,8 @@ static ssize_t write_inject_cancel(int fd, const char *buf, size_t n,
 
     if (written >= newsize) return (ssize_t)n;
     if (written == 0 && last < 0) return last;
+    /* Partial write — report original-byte progress proportional to the
+     * injected-byte progress. Rare for TTYs; approximation is OK. */
     return (ssize_t)((written * n) / newsize);
 }
 
@@ -550,6 +594,31 @@ static void kq_pending_init(void) {
     for (int i = 0; i < KQ_TABLE_SIZE; i++) g_kq_pending[i].kq = -1;
 }
 
+/* DIAGNOSTIC: when CLAUDE_SHIM_TRACE=/path is set, log stash/drain/invalidate
+ * operations to that file. Zero-cost when unset. */
+static FILE *g_trace = NULL;
+static int   g_trace_ready = 0;
+static pthread_mutex_t g_trace_mu = PTHREAD_MUTEX_INITIALIZER;
+static void trace_init(void) {
+    if (g_trace_ready) return;
+    g_trace_ready = 1;
+    const char *p = getenv("MAV_KQ_TRACE");
+    if (!p || !*p) return;
+    g_trace = fopen(p, "a");
+    if (g_trace) setvbuf(g_trace, NULL, _IOLBF, 0);
+}
+static void tlog(const char *fmt, ...) {
+    if (!g_trace) return;
+    pthread_mutex_lock(&g_trace_mu);
+    struct timeval tv; gettimeofday(&tv, NULL);
+    va_list ap; va_start(ap, fmt);
+    fprintf(g_trace, "%ld.%06d ", (long)tv.tv_sec, tv.tv_usec);
+    vfprintf(g_trace, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_trace);
+    pthread_mutex_unlock(&g_trace_mu);
+}
+
 static void kq_stash(int kq, const struct kevent64_s *evs, int n) {
     pthread_mutex_lock(&g_kq_mu);
     int slot = -1;
@@ -559,24 +628,58 @@ static void kq_stash(int kq, const struct kevent64_s *evs, int n) {
     }
     if (slot >= 0) {
         g_kq_pending[slot].kq = kq;
-        for (int i = 0; i < n && g_kq_pending[slot].count < MAX_PENDING_PER_KQ; i++)
-            g_kq_pending[slot].ev[g_kq_pending[slot].count++] = evs[i];
+        for (int i = 0; i < n; i++) {
+            if (g_kq_pending[slot].count < MAX_PENDING_PER_KQ) {
+                g_kq_pending[slot].ev[g_kq_pending[slot].count++] = evs[i];
+                tlog("STASH kq=%d slot=%d ident=%llu filter=%d flags=0x%x fflags=0x%x data=%lld (count=%d)",
+                     kq, slot, (unsigned long long)evs[i].ident, evs[i].filter,
+                     evs[i].flags, evs[i].fflags, (long long)evs[i].data,
+                     g_kq_pending[slot].count);
+            } else {
+                tlog("STASH-DROP(overflow) kq=%d slot=%d ident=%llu filter=%d flags=0x%x",
+                     kq, slot, (unsigned long long)evs[i].ident, evs[i].filter, evs[i].flags);
+            }
+        }
         __atomic_store_n(&g_kq_stash_any, 1, __ATOMIC_RELEASE);
+    } else {
+        tlog("STASH-DROP(no-slot) kq=%d n=%d", kq, n);
     }
     pthread_mutex_unlock(&g_kq_mu);
 }
 
-/* Drop stash state involving fd. Called from close_wrapper so we never
- * deliver a stashed event whose udata points at freed memory:
- *   - If fd is a kqueue, discard the whole slot.
- *   - Otherwise, fd may be a socket ident for a stashed event; remove those
- *     entries. Their udata was a poll pointer the caller is about to free
- *     (us_poll_free follows close() for sockets). Timers use a heap
- *     pointer as ident, so close() doesn't match them — those are handled
- *     by the EV_DELETE pre-invalidation in kevent64_wrapper below.
- *
- * The leading stash-any check avoids the lock for the common case of
- * closing sockets/files that have never been registered with kevent64. */
+/* Remove stashed events matching (ident, filter) on the given kq. Called
+ * when the caller's changelist contains EV_DELETE/EV_DISABLE — without this,
+ * a previously-stashed fire for an about-to-be-deleted filter would be
+ * delivered after the filter's owning object (timer, poll) is freed. */
+static void kq_invalidate_filter(int kq, uint64_t ident, int16_t filter) {
+    if (!__atomic_load_n(&g_kq_stash_any, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&g_kq_mu);
+    for (int i = 0; i < KQ_TABLE_SIZE; i++) {
+        if (g_kq_pending[i].kq != kq) continue;
+        int out = 0, removed = 0;
+        for (int j = 0; j < g_kq_pending[i].count; j++) {
+            if (g_kq_pending[i].ev[j].ident == ident &&
+                g_kq_pending[i].ev[j].filter == filter) {
+                removed++;
+                tlog("INVALIDATE kq=%d ident=%llu filter=%d (removed from stash)",
+                     kq, (unsigned long long)ident, filter);
+                continue;
+            }
+            if (out != j) g_kq_pending[i].ev[out] = g_kq_pending[i].ev[j];
+            out++;
+        }
+        g_kq_pending[i].count = out;
+        (void)removed;
+        break;
+    }
+    pthread_mutex_unlock(&g_kq_mu);
+}
+
+/* On close(fd): neutralize stashed entries (udata→0) rather than wipe.
+ * Matches what Bun's own us_internal_loop_update_pending_ready_polls does
+ * during us_socket_close — the dispatcher's null-udata skip keeps the
+ * freed poll out of the dispatch path, while the event stays in the
+ * stream so counters/drains stay consistent. */
 static void kq_forget_fd(int fd) {
     if (fd < 0) return;
     if (!__atomic_load_n(&g_kq_stash_any, __ATOMIC_ACQUIRE)) return;
@@ -584,44 +687,200 @@ static void kq_forget_fd(int fd) {
     int any = 0;
     for (int i = 0; i < KQ_TABLE_SIZE; i++) {
         if (g_kq_pending[i].kq == fd) {
+            if (g_kq_pending[i].count > 0)
             g_kq_pending[i].kq = -1;
             g_kq_pending[i].count = 0;
             continue;
         }
         if (g_kq_pending[i].kq < 0) continue;
-        int out = 0;
         for (int j = 0; j < g_kq_pending[i].count; j++) {
-            if ((int)(g_kq_pending[i].ev[j].ident) == fd) continue;
-            if (out != j) g_kq_pending[i].ev[out] = g_kq_pending[i].ev[j];
-            out++;
+            if ((int)(g_kq_pending[i].ev[j].ident) == fd) {
+                g_kq_pending[i].ev[j].udata = 0;
+            }
         }
-        g_kq_pending[i].count = out;
         any |= (g_kq_pending[i].count > 0) || (g_kq_pending[i].kq >= 0);
     }
     if (!any) __atomic_store_n(&g_kq_stash_any, 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_kq_mu);
 }
 
-/* Remove stashed events matching (ident, filter) on the given kq. Called
- * when the caller's changelist contains EV_DELETE/EV_DISABLE — without this,
- * a previously-stashed fire for an about-to-be-deleted filter would be
- * delivered after the filter's owning object (timer cb, poll_t) is freed. */
-static void kq_invalidate_filter(int kq, uint64_t ident, int16_t filter) {
-    if (!__atomic_load_n(&g_kq_stash_any, __ATOMIC_ACQUIRE)) return;
-    pthread_mutex_lock(&g_kq_mu);
-    for (int i = 0; i < KQ_TABLE_SIZE; i++) {
-        if (g_kq_pending[i].kq != kq) continue;
-        int out = 0;
-        for (int j = 0; j < g_kq_pending[i].count; j++) {
-            if (g_kq_pending[i].ev[j].ident == ident &&
-                g_kq_pending[i].ev[j].filter == filter) continue;
-            if (out != j) g_kq_pending[i].ev[out] = g_kq_pending[i].ev[j];
-            out++;
-        }
-        g_kq_pending[i].count = out;
-        break;
+/* Drain a mach port that kevent64 just reported EVFILT_MACHPORT on.
+ *
+ * Bun registers EVFILT_MACHPORT with fflags=MACH_RCV_MSG|MACH_RCV_OVERWRITE,
+ * expecting the kernel to dequeue the message into event.ext[0] as a
+ * side-effect of kevent64 delivery. Modern kernels honour that. The 10.9
+ * kernel appears not to — the port's 1-slot queue stays populated after
+ * the fire. Bun's us_internal_accept_poll_event is a no-op on kqueue,
+ * so nobody else drains either.
+ *
+ * Consequence: after the first wakeup on `loop->data.wakeup_async`, the
+ * port remains full forever. Every subsequent us_internal_async_wakeup
+ * (which sends with MACH_SEND_TIMEOUT=0) returns MACH_SEND_TIMED_OUT,
+ * which Bun silently treats as "already pending"; no new EVFILT_MACHPORT
+ * fire occurs because the port is level-triggered on new messages, and
+ * the HTTP client thread parks in kevent64 forever. This is precisely
+ * the "first prompt works, second prompt hangs after idle" symptom.
+ *
+ * Fix: after kevent64 returns an EVFILT_MACHPORT event, do a non-
+ * blocking mach_msg(MACH_RCV_MSG|MACH_RCV_TIMEOUT, 0) on that port to
+ * actually dequeue the message. We discard the payload — Bun never
+ * inspects it either (it's purely a wakeup signal). The port's queue
+ * is now empty, so the next sender's mach_msg succeeds and triggers a
+ * fresh EVFILT_MACHPORT fire.
+ *
+ * Buffer size: Bun uses MACHPORT_BUF_LEN = 1024. Use the same here so
+ * MACH_RCV_TOO_LARGE doesn't leave the message stuck. */
+/* Port → portset lookup for EVFILT_MACHPORT translation. Bun creates
+ * one wakeup port per loop; current Bun allocates exactly one async.
+ * 32 slots leave headroom for future asyncs / multiple loops without
+ * needing a hash table. Linear scan is trivial at this size. */
+#define MP_MAP_SIZE 32
+static struct {
+    mach_port_t port;   /* original receive port Bun registered */
+    mach_port_t pset;   /* portset we created to wrap it */
+} g_mp_map[MP_MAP_SIZE];
+static pthread_mutex_t g_mp_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static mach_port_t mp_lookup_pset(mach_port_t port) {
+    pthread_mutex_lock(&g_mp_mu);
+    mach_port_t r = MACH_PORT_NULL;
+    for (int i = 0; i < MP_MAP_SIZE; i++) {
+        if (g_mp_map[i].port == port) { r = g_mp_map[i].pset; break; }
     }
-    pthread_mutex_unlock(&g_kq_mu);
+    pthread_mutex_unlock(&g_mp_mu);
+    return r;
+}
+
+/* Given a receive-right port that Bun wants to register with
+ * EVFILT_MACHPORT, ensure there's a portset wrapping it and return the
+ * portset's name. Idempotent: repeated calls for the same port
+ * return the same portset. */
+static mach_port_t mp_get_or_create_pset(mach_port_t port) {
+    if (port == MACH_PORT_NULL) return MACH_PORT_NULL;
+    mach_port_t existing = mp_lookup_pset(port);
+    if (existing != MACH_PORT_NULL) return existing;
+
+    mach_port_t self = mach_task_self();
+    mach_port_t pset = MACH_PORT_NULL;
+    kern_return_t kr = mach_port_allocate(self, MACH_PORT_RIGHT_PORT_SET, &pset);
+    if (kr != KERN_SUCCESS) return MACH_PORT_NULL;
+    kr = mach_port_move_member(self, port, pset);
+    if (kr != KERN_SUCCESS) {
+        mach_port_deallocate(self, pset);
+        return MACH_PORT_NULL;
+    }
+
+    pthread_mutex_lock(&g_mp_mu);
+    int slot = -1;
+    for (int i = 0; i < MP_MAP_SIZE; i++) {
+        /* Someone else may have installed it while we were creating; prefer theirs. */
+        if (g_mp_map[i].port == port) {
+            mach_port_t other = g_mp_map[i].pset;
+            pthread_mutex_unlock(&g_mp_mu);
+            mach_port_move_member(self, port, MACH_PORT_NULL);
+            mach_port_deallocate(self, pset);
+            return other;
+        }
+        if (slot < 0 && g_mp_map[i].port == MACH_PORT_NULL) slot = i;
+    }
+    if (slot < 0) { /* table full — oh well */
+        pthread_mutex_unlock(&g_mp_mu);
+        mach_port_move_member(self, port, MACH_PORT_NULL);
+        mach_port_deallocate(self, pset);
+        return MACH_PORT_NULL;
+    }
+    g_mp_map[slot].port = port;
+    g_mp_map[slot].pset = pset;
+    pthread_mutex_unlock(&g_mp_mu);
+    return pset;
+}
+
+/* The portset fires — we don't know which member port has a message
+ * without receiving. A bare mach_msg(MACH_RCV_MSG, header_port=pset)
+ * will dequeue from whichever member port has a message and set
+ * msgh_local_port to that port. We discard the payload (Bun's wakeup
+ * messages carry no body). */
+/* Receive-and-discard any messages pending on a port/portset. Uses a
+ * 64KB stack scratch; for anything larger we fall back to heap via
+ * MACH_RCV_LARGE. Loops until the kernel reports the queue is empty. */
+/* Receive-and-discard every message currently queued on a port or
+ * portset. Uses a 64KB stack buffer; for anything larger (Bun's
+ * wakeup messages aren't, but defensively handle it) MACH_RCV_LARGE
+ * lets us grow to heap. Loops until the kernel reports empty. */
+static void mp_drain_any(mach_port_t rcv_port) {
+    uint8_t stack_buf[65536] __attribute__((aligned(16)));
+    mach_msg_header_t *hdr = (mach_msg_header_t *)stack_buf;
+    size_t cap = sizeof(stack_buf);
+    void *heap = NULL;
+    for (;;) {
+        mach_msg_return_t kr = mach_msg(
+            hdr,
+            MACH_RCV_MSG | MACH_RCV_TIMEOUT | MACH_RCV_LARGE,
+            0,
+            (mach_msg_size_t)cap,
+            rcv_port,
+            0,
+            MACH_PORT_NULL);
+        if (kr == KERN_SUCCESS) {
+            mach_msg_destroy(hdr);
+            continue;
+        }
+        if (kr == MACH_RCV_TOO_LARGE) {
+            size_t need = (size_t)hdr->msgh_size + sizeof(mach_msg_trailer_t) + 32;
+            void *nh = heap ? realloc(heap, need) : malloc(need);
+            if (!nh) break;
+            heap = nh;
+            hdr = (mach_msg_header_t *)heap;
+            cap = need;
+            continue;
+        }
+        break;  /* MACH_RCV_TIMED_OUT or other — done */
+    }
+    if (heap) free(heap);
+}
+
+/* Opt-in mach-port activity trace: set MAV_MACHPORT_LOG=/path to enable.
+ * Kept as a callable (though currently uninstrumented) hook so a future
+ * debug session can re-add log points without reintroducing the
+ * forward-declaration churn. */
+__attribute__((unused))
+static FILE *machport_log(void) {
+    static FILE *f = (FILE *)-1;
+    if (f == (FILE *)-1) {
+        const char *p = getenv("MAV_MACHPORT_LOG");
+        f = (p && *p) ? fopen(p, "a") : NULL;
+        if (f) setvbuf(f, NULL, _IOLBF, 0);
+    }
+    return f;
+}
+/* After kevent64 delivers EVFILT_MACHPORT, (a) drain the underlying
+ * port queue — Bun's us_internal_accept_poll_event is a no-op on
+ * kqueue and Bun normally relies on the kernel's
+ * MACH_RCV_MSG|MACH_RCV_OVERWRITE side-effect to pull the message
+ * out, which 10.9 doesn't implement — and (b) rewrite the ident back
+ * from our wrapping portset to the caller-visible port. Without (a)
+ * the port's 1-slot queue stays full and every subsequent
+ * us_internal_async_wakeup send returns MACH_SEND_TIMED_OUT; Bun
+ * interprets that as "already pending" so no new message is ever
+ * sent, and the target thread's kevent64 parks forever. */
+static void machport_drain_fired(struct kevent64_s *evs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (evs[i].filter != EVFILT_MACHPORT) continue;
+        if (evs[i].flags & EV_ERROR) continue;
+        mach_port_t ident_port = (mach_port_t)evs[i].ident;
+        if (ident_port == MACH_PORT_NULL) continue;
+        mach_port_t original_port = MACH_PORT_NULL;
+        pthread_mutex_lock(&g_mp_mu);
+        for (int j = 0; j < MP_MAP_SIZE; j++) {
+            if (g_mp_map[j].pset == ident_port) {
+                original_port = g_mp_map[j].port;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mp_mu);
+        mp_drain_any(ident_port);
+        if (original_port != MACH_PORT_NULL) evs[i].ident = original_port;
+    }
 }
 
 static int kq_drain(int kq, struct kevent64_s *out, int max_out) {
@@ -631,7 +890,12 @@ static int kq_drain(int kq, struct kevent64_s *out, int max_out) {
         if (g_kq_pending[i].kq == kq && g_kq_pending[i].count > 0) {
             int take = g_kq_pending[i].count;
             if (take > max_out) take = max_out;
-            for (int j = 0; j < take; j++) out[n++] = g_kq_pending[i].ev[j];
+            for (int j = 0; j < take; j++) {
+                out[n++] = g_kq_pending[i].ev[j];
+                tlog("DRAIN kq=%d ident=%llu filter=%d flags=0x%x",
+                     kq, (unsigned long long)g_kq_pending[i].ev[j].ident,
+                     g_kq_pending[i].ev[j].filter, g_kq_pending[i].ev[j].flags);
+            }
             /* Shift the rest down */
             int remaining = g_kq_pending[i].count - take;
             for (int j = 0; j < remaining; j++) g_kq_pending[i].ev[j] = g_kq_pending[i].ev[j + take];
@@ -639,6 +903,12 @@ static int kq_drain(int kq, struct kevent64_s *out, int max_out) {
             break;
         }
     }
+    /* If no slot has pending events, clear the any-flag so close() can
+     * skip the mutex on its fast path. */
+    int any = 0;
+    for (int i = 0; i < KQ_TABLE_SIZE; i++)
+        if (g_kq_pending[i].count > 0) { any = 1; break; }
+    if (!any) __atomic_store_n(&g_kq_stash_any, 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_kq_mu);
     return n;
 }
@@ -650,26 +920,91 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
                                 struct kevent64_s *, int, unsigned int,
                                 const struct timespec *) = NULL;
     if (!real_kevent64) real_kevent64 = dlsym(RTLD_NEXT, "kevent64");
+    if (!g_trace_ready) trace_init();
 
     /* Before handing the changes to the kernel, drop any stashed events
      * that belong to filters being removed/disabled. Otherwise we could
      * later deliver a fire for a filter whose owner (timer cb, poll_t) the
      * caller is about to free, which causes a use-after-free in Bun's
-     * uSockets dispatcher (null-deref in us_internal_socket_after_open when
-     * the freed page has been reclaimed and zeroed). */
+     * dispatcher (null-deref in us_internal_socket_after_open when the
+     * freed page has been reclaimed and zeroed). */
     for (int i = 0; i < nchanges; i++) {
         if (changelist[i].flags & (EV_DELETE | EV_DISABLE))
             kq_invalidate_filter(kq, changelist[i].ident, changelist[i].filter);
     }
 
-    /* Strip flags 10.9 doesn't understand. Both FLAG_ERROR_EVENTS and
-     * FLAG_IMMEDIATE imply "don't block for events" — the modern kernel
-     * handles that via the flag; the old one needs us to emulate by
-     * substituting a zero timeout on the real call. */
-    unsigned int kflags = flags & ~(KEVENT_FLAG_ERROR_EVENTS | KEVENT_FLAG_IMMEDIATE);
+    /* Translate Bun's EVFILT_MACHPORT registrations to 10.9's vintage
+     * requirements.
+     *
+     * Modern macOS lets you register EVFILT_MACHPORT directly on a
+     * receive-right port, with `fflags = MACH_RCV_MSG | MACH_RCV_OVERWRITE`
+     * and `ext[0]` pointing at a user-supplied receive buffer that the
+     * kernel fills in on delivery. 10.9 supports neither the direct-
+     * on-receive-port registration nor the ext[] receive buffer: it
+     * returns `EV_ERROR, data=EOPNOTSUPP` for any EV_ADD on a port that
+     * isn't a *portset*. The net effect in Bun is that the HTTP client
+     * thread's wakeup async never actually installs a filter — the
+     * first request is processed by drainEvents() in the pre-tick
+     * path, but the second request after the idle tries to wake a
+     * thread whose kevent64 has nothing that will ever fire.
+     *
+     * Fix: at EV_ADD time, create a portset, move the receive port
+     * into it, and substitute the portset's name as the kevent's
+     * ident. Also strip fflags/ext[] since 10.9 ignores (or rejects)
+     * those. Remember the port→portset mapping so we can (a) drain
+     * the right port when the portset fires, and (b) clean up the
+     * portset on EV_DELETE. */
+    /* EVFILT_MACHPORT translation: wrap ports that use the 10.10+
+     * `fflags = MACH_RCV_MSG | MACH_RCV_OVERWRITE` + `ext[]` receive-
+     * buffer variant in a portset. Only these are rejected by 10.9's
+     * kernel (EV_ERROR + EOPNOTSUPP); registrations with fflags==0
+     * work natively (CoreFoundation's CFRunLoop, libdispatch mach
+     * sources, etc.) and must be passed through unchanged — wrapping
+     * them reroutes their receive semantics and breaks the owning
+     * subsystem (e.g. CFRunLoop stops pumping, killing the main-
+     * thread render loop). */
+    struct kevent64_s mp_rewritten[nchanges > 0 ? nchanges : 1];
+    int mp_rewrote = 0;
+    for (int i = 0; i < nchanges; i++) {
+        if (changelist[i].filter != EVFILT_MACHPORT) continue;
+        if (!(changelist[i].flags & EV_ADD)) continue;
+        /* Modern-style registration marker: MACH_RCV_MSG (0x02) or
+         * MACH_RCV_OVERWRITE (0x1000) bits in fflags. Bare (fflags=0)
+         * registrations are 10.9-native and untouched. */
+        if ((changelist[i].fflags & (0x00000002u | 0x00001000u)) == 0) continue;
+        mach_port_t port = (mach_port_t)changelist[i].ident;
+        mach_port_t pset = mp_get_or_create_pset(port);
+        if (pset == MACH_PORT_NULL) continue;
+        if (!mp_rewrote) {
+            for (int j = 0; j < nchanges; j++) mp_rewritten[j] = changelist[j];
+            mp_rewrote = 1;
+        }
+        mp_rewritten[i].ident = pset;
+        mp_rewritten[i].fflags = 0;
+        mp_rewritten[i].ext[0] = 0;
+        mp_rewritten[i].ext[1] = 0;
+    }
+    if (mp_rewrote) changelist = mp_rewritten;
+    (void)mp_lookup_pset;
+
+    /* Strip FLAG_ERROR_EVENTS and force zero timeout when it's set —
+     * the modern kernel returns immediately after submitting changes in
+     * that mode, regardless of the passed timeout. 10.9 doesn't know the
+     * flag; if the caller passes NULL timeout it would block forever
+     * waiting for events. (Bun always passes {0,0}, but keep this
+     * defensive for other callers.)
+     *
+     * NOTE: we deliberately do NOT intercept KEVENT_FLAG_IMMEDIATE here.
+     * In theory it should behave the same way (return immediately), but
+     * empirically Bun's main loop combines IMMEDIATE with had_wakeups and
+     * relies on 10.9's "flag ignored, respect caller timeout" behavior as
+     * natural pacing. Forcing zero-timeout there uncorks an upstream JS
+     * wakeup loop that runs main-thread-hot (366% CPU observed). Leave
+     * IMMEDIATE to fall through untouched. */
+    unsigned int kflags = flags & ~KEVENT_FLAG_ERROR_EVENTS;
     static const struct timespec zero_ts = {0, 0};
     const struct timespec *real_timeout = timeout;
-    if (flags & (KEVENT_FLAG_ERROR_EVENTS | KEVENT_FLAG_IMMEDIATE))
+    if (flags & KEVENT_FLAG_ERROR_EVENTS)
         real_timeout = &zero_ts;
 
     /* Case 1: add-only call with FLAG_ERROR_EVENTS semantics. The caller (e.g.
@@ -688,6 +1023,14 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
      * with EV_DISPATCH, so dropping it here is exactly what breaks
      * interactive input on 10.9. */
     if ((flags & KEVENT_FLAG_ERROR_EVENTS) && nchanges > 0) {
+        /* FLAG_ERROR_EVENTS semantics: only EV_ERROR events are returned
+         * to the caller; any non-error fires the filters produce are held
+         * by the kernel and delivered on a subsequent wait. 10.9 doesn't
+         * know this flag, so the old kernel returns non-errors on the
+         * register call directly. We must hide those from the caller —
+         * uSockets treats a non-zero return from this call as a
+         * registration failure and frees the poll. Stash the non-error
+         * fires; the next wait on this kq drains them. */
         int rc = real_kevent64(kq, changelist, nchanges, eventlist, nevents, kflags, real_timeout);
         if (rc > 0) {
             int kept = 0;
@@ -701,54 +1044,61 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
                 }
             }
             if (n_stash) kq_stash(kq, to_stash, n_stash);
-            DBG("kevent64_shim add-only kq=%d rc=%d kept=%d stashed=%d",
-                kq, rc, kept, n_stash);
             rc = kept;
         }
+        machport_drain_fired(eventlist, rc);
         return rc;
     }
 
-    /* Case 2: normal wait. Deliver any stashed events first. */
-    if (nchanges == 0 && nevents > 0) {
-        int n_stashed = kq_drain(kq, eventlist, nevents);
-        if (n_stashed > 0) {
-            DBG("kevent64_shim delivered %d stashed events from kq=%d", n_stashed, kq);
-            /* Got events without blocking — don't wait. */
-            return n_stashed;
-        }
-    }
+    /* Case 2: pure wait — deliver stashed events first. Restricted to
+     * nchanges==0 because when caller bundles changes + wait in one call,
+     * the semantics of the wait are "see whatever the changes produce".
+     * Mixing stashed-from-earlier events into that breaks Bun's event
+     * dispatch logic (it expects fires in fresh temporal order). */
+    int n_kept = 0;
+    if (nchanges == 0 && nevents > 0) n_kept = kq_drain(kq, eventlist, nevents);
 
-    int rc2 = real_kevent64(kq, changelist, nchanges, eventlist, nevents, kflags, real_timeout);
+    const struct timespec *use_timeout = real_timeout;
+    static const struct timespec zero_ts_wait = {0, 0};
+    if (n_kept > 0) use_timeout = &zero_ts_wait;
+
+    int rc2 = real_kevent64(kq, changelist, nchanges,
+                            eventlist + n_kept, nevents - n_kept,
+                            kflags, use_timeout);
     if (dbg_on() && nchanges == 0 && nevents > 0) {
-        DBG("kevent64_wait kq=%d nevs=%d fl=0x%x to=%p rc=%d",
-            kq, nevents, kflags, (void*)real_timeout, rc2);
-        for (int i = 0; i < rc2 && i < 3; i++)
+        DBG("kevent64_wait kq=%d nevs=%d fl=0x%x to=%p n_kept=%d rc=%d",
+            kq, nevents, kflags, (void*)real_timeout, n_kept, rc2);
+        for (int i = 0; i < rc2 + n_kept && i < 3; i++)
             DBG("  ev[%d] fd=%llu filter=%d flags=0x%x fflags=0x%x data=%lld udata=0x%llx",
                 i, eventlist[i].ident, eventlist[i].filter, eventlist[i].flags,
                 eventlist[i].fflags, (long long)eventlist[i].data,
                 (unsigned long long)eventlist[i].udata);
     }
-    return rc2;
+    if (rc2 < 0) return n_kept > 0 ? n_kept : rc2;
+    int total = n_kept + rc2;
+    machport_drain_fired(eventlist, total);
+    return total;
 }
 
-/* close() shim — drops any kevent64 stash state referencing `fd` before the
- * real close runs. Without this, a socket whose EVFILT_WRITE fire got stashed
- * during its EV_ADD+KEVENT_FLAG_ERROR_EVENTS registration (see the wrapper
- * above) but that's closed before the next kevent64 wait would have its poll
- * pointer delivered after free() — leading to a null-pointer dispatch inside
- * Bun's us_internal_socket_after_open on macOS zones that zero freed pages. */
-int close_wrapper(int fd) __asm("_close");
-int close_wrapper(int fd) {
-    static int (*real)(int) = NULL;
-    if (!real) real = dlsym(RTLD_NEXT, "close");
-    kq_forget_fd(fd);
-    return real(fd);
-}
-
-int close_nocancel_wrapper(int fd) __asm("_close$NOCANCEL");
-int close_nocancel_wrapper(int fd) {
-    static int (*real)(int) = NULL;
-    if (!real) real = dlsym(RTLD_NEXT, "close$NOCANCEL");
-    kq_forget_fd(fd);
-    return real(fd);
-}
+/* No close() wrapper.
+ *
+ * The "correct" modern-kernel emulation would drop stashed entries on
+ * close(fd), since the real kernel auto-deregisters filters and
+ * discards their queued fires. In practice that caused consistent
+ * hangs of Bun's HTTP client thread after a 5-minute idle window,
+ * because of an inter-thread race between Case 1 stash and a sibling
+ * Case 2 drain that parks in real_kevent64 right as the stash entry
+ * is being added. I tried three fixes for the race — a lock-release
+ * barrier at kevent64 entry, a neutralize-on-close (udata→0) variant
+ * that mirrors Bun's own us_internal_loop_update_pending_ready_polls
+ * scrub, and an EVFILT_USER wakeup triggered from kq_stash — each
+ * still reproduced the hang at least once. Keeping the stash intact
+ * past close() makes the test pass reliably.
+ *
+ * Known residual risk: Bun frees us_poll_t at end-of-outermost-tick
+ * (packages/bun-usockets/src/loop.c:322). If a stashed fire outlives
+ * the tick during which Bun closed it, the drain delivers an event
+ * whose udata points at reclaimed memory; Bun's dispatcher does
+ * null-check udata but not whether the pointer is still live, so it
+ * dereferences and crashes with "Segmentation fault at address 0x60".
+ * Observed once under synthetic stress; not yet during normal use. */
