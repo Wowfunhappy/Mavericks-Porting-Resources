@@ -404,6 +404,17 @@ int __darwin_check_fd_set_overflow(int fd, void *set, int unlimited_select) {
     return 1;
 }
 
+/* ── __chk_fail: 10.10+ FORTIFY_SOURCE bounds-check trap. Pulled in by
+ * libMacportsLegacySupport's stpncpy_chk.o (and friends). Not present in
+ * 10.9 libSystem, so we have to define it here or the link fails. Behave
+ * the same as the system version: write to stderr and abort. */
+__attribute__((noreturn))
+void __chk_fail(void) {
+    static const char msg[] = "*** buffer overflow detected (chk) ***\n";
+    write(2, msg, sizeof(msg) - 1);
+    abort();
+}
+
 /* ── TIOCGWINSZ shim: on macOS 10.9, `ioctl(TIOCGWINSZ, 0, ...)` on an
  * inherited stdin that points at a pty returns rows=0, cols=0 — even when the
  * same pty queried via fd=1 or fd=2 reports the correct dimensions. Bun's
@@ -903,10 +914,28 @@ static int kq_drain(int kq, struct kevent64_s *out, int max_out) {
             int take = g_kq_pending[i].count;
             if (take > max_out) take = max_out;
             for (int j = 0; j < take; j++) {
-                out[n++] = g_kq_pending[i].ev[j];
+                struct kevent64_s *ev = &g_kq_pending[i].ev[j];
+                /* Drop fd-based stashed fires whose ident has been closed.
+                 * uSockets ties us_poll_t lifetime to the socket fd: when
+                 * Bun closes the socket, us_poll_free runs at end-of-tick
+                 * and the stashed event's udata becomes a dangling pointer.
+                 * fcntl(F_GETFD) returns -1/EBADF on a closed fd, which is
+                 * a strong signal that the owning poll is gone. Delivering
+                 * the event anyway crashes Bun's dispatcher in
+                 * us_internal_dispatch_ready_poll (segfault at offset 0x30
+                 * of the freed-and-reclaimed allocation). Silently dropping
+                 * is correct: the consumer is no longer interested in the fd. */
+                int16_t f = ev->filter;
+                if ((f == EVFILT_READ || f == EVFILT_WRITE ||
+                     f == EVFILT_VNODE) &&
+                    fcntl((int)ev->ident, F_GETFD) < 0) {
+                    tlog("DRAIN-DROP-STALE kq=%d ident=%llu filter=%d (fd closed)",
+                         kq, (unsigned long long)ev->ident, f);
+                    continue;
+                }
+                out[n++] = *ev;
                 tlog("DRAIN kq=%d ident=%llu filter=%d flags=0x%x",
-                     kq, (unsigned long long)g_kq_pending[i].ev[j].ident,
-                     g_kq_pending[i].ev[j].filter, g_kq_pending[i].ev[j].flags);
+                     kq, (unsigned long long)ev->ident, f, ev->flags);
             }
             /* Shift the rest down */
             int remaining = g_kq_pending[i].count - take;
@@ -1107,13 +1136,14 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
  * still reproduced the hang at least once. Keeping the stash intact
  * past close() makes the test pass reliably.
  *
- * Known residual risk: Bun frees us_poll_t at end-of-outermost-tick
- * (packages/bun-usockets/src/loop.c:322). If a stashed fire outlives
- * the tick during which Bun closed it, the drain delivers an event
- * whose udata points at reclaimed memory; Bun's dispatcher does
- * null-check udata but not whether the pointer is still live, so it
- * dereferences and crashes with "Segmentation fault at address 0x60".
- * Observed once under synthetic stress; not yet during normal use. */
+ * UAF defense without close() interception: kq_drain validates each
+ * fd-based stashed event's ident with fcntl(F_GETFD) before delivery
+ * and drops it if the fd is closed. uSockets ties us_poll_t lifetime
+ * to the socket fd (us_poll_free → close(fd)), so a closed fd is a
+ * reliable signal that the udata is now a dangling pointer. Without
+ * this, a fresh-machine first request would dequeue a stale fire and
+ * crash Bun's dispatcher in us_internal_dispatch_ready_poll — segfault
+ * at offset 0x30 of the freed-and-reclaimed allocation. */
 
 
 /* ── dlopen interposer ──────────────────────────────────────────────────────
