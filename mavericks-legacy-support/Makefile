@@ -41,9 +41,10 @@ WARN        = -Wall -Wno-deprecated-declarations
 ALLCFLAGS   = $(ARCHFLAGS) $(DEPTARGET) $(OPT) $(WARN) -fPIC -Iinclude $(CFLAGS)
 ALLLDFLAGS  = $(ARCHFLAGS) $(DEPTARGET) $(LDFLAGS)
 
-# Frameworks needed by the wowfunhappy.c custom polyfills (Security/CF/objc).
+# Frameworks needed by the wowfunhappy.c custom polyfills (Security/CF/objc, and
+# CoreServices for the LaunchServices back-fill in launchservices.c).
 # The dylibs link them directly; static-lib consumers must add these too.
-WFHLIBS     = -framework CoreFoundation -framework Security -lobjc
+WFHLIBS     = -framework CoreFoundation -framework Security -framework CoreServices -lobjc
 
 # ---- Derived names ---------------------------------------------------------
 
