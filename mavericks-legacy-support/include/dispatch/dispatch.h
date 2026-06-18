@@ -14,28 +14,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-/* Include the primary system mach/machine.h */
-#include_next <mach/machine.h>
+/* Include the primary system dispatch/dispatch.h */
+#include_next <dispatch/dispatch.h>
 
-#ifndef CPU_TYPE_ARM
-#define CPU_TYPE_ARM            ((cpu_type_t) 12)
-#endif
+/*
+  dispatch_activate() was added in macOS 10.12.  Before it, a suspended-on-
+  creation dispatch source/object was started with a single dispatch_resume().
+  For the one-shot activation that callers (e.g. lldb's MemoryMonitorMacOSX)
+  perform, dispatch_resume() is the correct 10.9 equivalent. */
 
-#ifndef CPU_SUBTYPE_ARM64E
-#define CPU_SUBTYPE_ARM64E      ((cpu_subtype_t) 2)
-#endif
-
-/* cpu subtype constants added to <mach/machine.h> after 10.9.  Modern code
-   (e.g. lldb's HostInfoMacOSX) references them in arch tables even when the
-   host is x86_64; supply the upstream values so it compiles. */
-#ifndef CPU_SUBTYPE_X86_64_H
-#define CPU_SUBTYPE_X86_64_H    ((cpu_subtype_t) 8)
-#endif
-
-#ifndef CPU_SUBTYPE_ARM64_ALL
-#define CPU_SUBTYPE_ARM64_ALL   ((cpu_subtype_t) 0)
-#endif
-
-#ifndef CPU_SUBTYPE_ARM64_V8
-#define CPU_SUBTYPE_ARM64_V8    ((cpu_subtype_t) 1)
+#ifndef dispatch_activate
+#define dispatch_activate(object) dispatch_resume(object)
 #endif

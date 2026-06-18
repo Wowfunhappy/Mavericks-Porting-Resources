@@ -23,7 +23,9 @@
  * definitions; otherwise we just pass through the SDK header as is.
  */
 
-/* Do our SDK-related setup */
+/* MP support header (self-contained: defines __MP__BEGIN_DECLS used below, so this
+   header works when included on its own via -isystem, not only after LegacySupport.h) */
+#include "LegacySupport.h"
 
 /* Options for clonefile calls */
 #define CLONE_NOFOLLOW   0x0001     /* Don't follow symbolic links */
