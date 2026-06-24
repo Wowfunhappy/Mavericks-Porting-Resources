@@ -56,3 +56,32 @@ void *swift_getWitnessTable(void *conformance, void *type, void *instantiationAr
     (void)conformance; (void)type; (void)instantiationArgs;
     return NULL;
 }
+
+/* Metadata-access runtime entry points that newer Swift binaries reference
+ * directly (a .NET host that links CryptoKit imports these even though it
+ * never drives the Swift runtime). Safe no-op/passthrough values suffice for
+ * load-time resolution; if any were actually called, these returns keep the
+ * caller from faulting. */
+
+/* MetadataResponse { const Metadata *Value; size_t State; }. MetadataState
+ * Complete == 0, so {type, 0} reads as "metadata fully realised". */
+typedef struct { const void *Value; unsigned long State; } swift_MetadataResponse;
+swift_MetadataResponse swift_checkMetadataState(unsigned long request, const void *type) {
+    (void)request;
+    swift_MetadataResponse r; r.Value = type; r.State = 0; return r;
+}
+void *swift_getAssociatedTypeWitness(unsigned long request, void *wtable,
+        const void *conformingType, const void *reqBase, const void *assocType) {
+    (void)request; (void)wtable; (void)conformingType; (void)reqBase; (void)assocType;
+    return NULL;
+}
+const void *swift_getAssociatedConformanceWitness(void *wtable, const void *conformingType,
+        const void *assocType, const void *reqBase, const void *assoc) {
+    (void)wtable; (void)conformingType; (void)assocType; (void)reqBase; (void)assoc;
+    return NULL;
+}
+void *swift_getTypeByMangledNameInContextInMetadataState(unsigned long state, const char *name,
+        unsigned long nameLength, const void *context, const void * const *genericArgs) {
+    (void)state; (void)name; (void)nameLength; (void)context; (void)genericArgs;
+    return NULL;
+}
