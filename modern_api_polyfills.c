@@ -21,6 +21,17 @@
  *   - kevent64 KEVENT_FLAG_ERROR_EVENTS shim with event stashing (fixes
  *     uSockets connect-completion loss on 10.9's kqueue, and Bun stdin
  *     EV_DISPATCH events that would otherwise be dropped)
+ *   - EVFILT_MACHPORT portset translation: 10.9's kqueue won't fire a bare
+ *     mach-port filter for (a) Bun's loop wakeup async (modern MACH_RCV_MSG
+ *     registration) or (b) libinfo's getaddrinfo_async reply ports (bare
+ *     fflags=0 + EV_ONESHOT). Both are wrapped in a portset so the old
+ *     kernel fires them; the wakeup port is drained (pure signal), the
+ *     getaddrinfo reply port is left intact (no_drain) so the caller's
+ *     getaddrinfo_async_handle_reply still receives the message. Without (b)
+ *     every node:dns.lookup — and therefore axios, the OAuth /login token
+ *     exchange, and WebFetch — hangs forever on 10.9 (native fetch uses a
+ *     direct getaddrinfo and is unaffected, which is why streaming worked
+ *     but fresh login never completed).
  *   - os_signpost no-ops, os_unfair_lock_assert_owner no-op
  *   - pthread_self_is_exiting_np / pthread_set_qos_class_self_np
  *   - dlopen interposer: when a .node file is loaded, rewrite any
@@ -44,6 +55,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/event.h>
@@ -761,6 +773,7 @@ static void kq_forget_fd(int fd) {
 static struct {
     mach_port_t port;   /* original receive port Bun registered */
     mach_port_t pset;   /* portset we created to wrap it */
+    int no_drain;       /* 1 = caller receives the msg itself (don't consume it) */
 } g_mp_map[MP_MAP_SIZE];
 static pthread_mutex_t g_mp_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -778,7 +791,7 @@ static mach_port_t mp_lookup_pset(mach_port_t port) {
  * EVFILT_MACHPORT, ensure there's a portset wrapping it and return the
  * portset's name. Idempotent: repeated calls for the same port
  * return the same portset. */
-static mach_port_t mp_get_or_create_pset(mach_port_t port) {
+static mach_port_t mp_get_or_create_pset(mach_port_t port, int no_drain) {
     if (port == MACH_PORT_NULL) return MACH_PORT_NULL;
     mach_port_t existing = mp_lookup_pset(port);
     if (existing != MACH_PORT_NULL) return existing;
@@ -814,6 +827,7 @@ static mach_port_t mp_get_or_create_pset(mach_port_t port) {
     }
     g_mp_map[slot].port = port;
     g_mp_map[slot].pset = pset;
+    g_mp_map[slot].no_drain = no_drain;
     pthread_mutex_unlock(&g_mp_mu);
     return pset;
 }
@@ -893,16 +907,27 @@ static void machport_drain_fired(struct kevent64_s *evs, int n) {
         mach_port_t ident_port = (mach_port_t)evs[i].ident;
         if (ident_port == MACH_PORT_NULL) continue;
         mach_port_t original_port = MACH_PORT_NULL;
+        int no_drain = 0;
         pthread_mutex_lock(&g_mp_mu);
         for (int j = 0; j < MP_MAP_SIZE; j++) {
             if (g_mp_map[j].pset == ident_port) {
                 original_port = g_mp_map[j].port;
+                no_drain = g_mp_map[j].no_drain;
                 break;
             }
         }
         pthread_mutex_unlock(&g_mp_mu);
-        mp_drain_any(ident_port);
-        if (original_port != MACH_PORT_NULL) evs[i].ident = original_port;
+        /* no_drain ports (e.g. getaddrinfo_async reply ports registered
+         * EV_ONESHOT with fflags=0): the caller does its own mach_msg
+         * receive (getaddrinfo_async_handle_reply), so we must NOT consume
+         * the message — only translate the portset ident back to the port
+         * Bun registered, so its dispatcher matches the fire to its poll. */
+        if (!no_drain) mp_drain_any(ident_port);
+        if (original_port != MACH_PORT_NULL) {
+            evs[i].ident = original_port;
+            tlog("MACHPORT-FIRE pset=%u -> port=%u no_drain=%d",
+                 (unsigned)ident_port, (unsigned)original_port, no_drain);
+        }
     }
 }
 
@@ -962,6 +987,12 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
                                 const struct timespec *) = NULL;
     if (!real_kevent64) real_kevent64 = dlsym(RTLD_NEXT, "kevent64");
     if (!g_trace_ready) trace_init();
+    if (g_trace && nchanges > 0) {
+        for (int _i = 0; _i < nchanges; _i++)
+            tlog("CHG kq=%d ident=%llu filter=%d flags=0x%x fflags=0x%x data=%lld",
+                 kq, (unsigned long long)changelist[_i].ident, changelist[_i].filter,
+                 changelist[_i].flags, changelist[_i].fflags, (long long)changelist[_i].data);
+    }
 
     /* Before handing the changes to the kernel, drop any stashed events
      * that belong to filters being removed/disabled. Otherwise we could
@@ -1009,21 +1040,47 @@ int kevent64_wrapper(int kq, const struct kevent64_s *changelist, int nchanges,
     for (int i = 0; i < nchanges; i++) {
         if (changelist[i].filter != EVFILT_MACHPORT) continue;
         if (!(changelist[i].flags & EV_ADD)) continue;
-        /* Modern-style registration marker: MACH_RCV_MSG (0x02) or
-         * MACH_RCV_OVERWRITE (0x1000) bits in fflags. Bare (fflags=0)
-         * registrations are 10.9-native and untouched. */
-        if ((changelist[i].fflags & (0x00000002u | 0x00001000u)) == 0) continue;
+        /* Two kinds of EVFILT_MACHPORT registration need wrapping on 10.9:
+         *
+         *  (1) Modern receive-and-overwrite: fflags has MACH_RCV_MSG (0x02)
+         *      or MACH_RCV_OVERWRITE (0x1000). Bun's loop wakeup async. The
+         *      kernel is expected to dequeue into ext[]; 10.9 doesn't, so we
+         *      wrap in a portset AND drain (Bun never receives it itself —
+         *      it's a pure wakeup signal).
+         *
+         *  (2) Bare one-shot: fflags==0 with EV_ONESHOT. This is libinfo's
+         *      getaddrinfo_async reply port — Bun registers it to be told
+         *      "a message arrived", then calls getaddrinfo_async_handle_reply
+         *      to receive it. On 10.9 a bare EVFILT_MACHPORT on Bun's kqueue
+         *      never fires for these dynamically-created reply ports, so the
+         *      DNS callback never runs and the lookup hangs forever. Wrap it
+         *      in a portset so 10.9 reliably fires — but mark it no_drain so
+         *      we leave the message for handle_reply to receive.
+         *
+         * Other bare (fflags==0, non-one-shot) registrations are left native:
+         * those are CFRunLoop / libdispatch mach sources that receive on the
+         * port themselves and must not be re-homed into our portset. */
+        int modern = (changelist[i].fflags & (0x00000002u | 0x00001000u)) != 0;
+        int bare_oneshot = (changelist[i].fflags == 0) &&
+                           (changelist[i].flags & EV_ONESHOT);
+        if (!modern && !bare_oneshot) continue;
         mach_port_t port = (mach_port_t)changelist[i].ident;
-        mach_port_t pset = mp_get_or_create_pset(port);
+        mach_port_t pset = mp_get_or_create_pset(port, /*no_drain=*/!modern);
         if (pset == MACH_PORT_NULL) continue;
         if (!mp_rewrote) {
             for (int j = 0; j < nchanges; j++) mp_rewritten[j] = changelist[j];
             mp_rewrote = 1;
         }
         mp_rewritten[i].ident = pset;
-        mp_rewritten[i].fflags = 0;
-        mp_rewritten[i].ext[0] = 0;
-        mp_rewritten[i].ext[1] = 0;
+        if (modern) {
+            mp_rewritten[i].fflags = 0;
+            mp_rewritten[i].ext[0] = 0;
+            mp_rewritten[i].ext[1] = 0;
+        }
+        /* bare_oneshot: keep fflags(0)/flags(EV_ADD|EV_ONESHOT) as-is, just
+         * swap the ident to the wrapping portset. */
+        tlog("MACHPORT-WRAP port=%u pset=%u modern=%d oneshot=%d",
+             (unsigned)port, (unsigned)pset, modern, bare_oneshot ? 1 : 0);
     }
     if (mp_rewrote) changelist = mp_rewritten;
     (void)mp_lookup_pset;
@@ -1372,4 +1429,26 @@ void *dlopen(const char *path, int mode) {
     void *h = g_real_dlopen(tmp, mode);
     unlink(tmp);
     return h;
+}
+
+/* DIAGNOSTIC (MAV_KQ_TRACE): mark when the new-connection path touches sockets. */
+int mav_socket(int domain, int type, int protocol) __asm("_socket");
+int mav_socket(int domain, int type, int protocol) {
+    static int (*real)(int,int,int) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "socket");
+    int fd = real(domain, type, protocol);
+    if (g_trace) { if (!g_trace_ready) trace_init(); tlog("SOCKET dom=%d type=%d -> fd=%d", domain, type, fd); }
+    return fd;
+}
+int mav_connect(int fd, const struct sockaddr *addr, socklen_t len) __asm("_connect");
+int mav_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    static int (*real)(int,const struct sockaddr*,socklen_t) = NULL;
+    if (!real) real = dlsym(RTLD_NEXT, "connect");
+    if (g_trace) { if (!g_trace_ready) trace_init();
+        int fam = addr?addr->sa_family:-1, port=0;
+        if (addr && fam==2)  port = ntohs(((const struct sockaddr_in *)addr)->sin_port);
+        if (addr && fam==30) port = ntohs(((const struct sockaddr_in6 *)addr)->sin6_port);
+        tlog("CONNECT fd=%d fam=%d port=%d", fd, fam, port);
+    }
+    return real(fd, addr, len);
 }
