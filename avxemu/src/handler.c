@@ -269,6 +269,33 @@ int avxemu_emulate(const decoded *d, avxemu_regfile *rf) {
         return 1;
     }
 
+    /* AVX2 masked move: per-lane conditional memory access (unmasked lanes are
+     * neither read nor written, so they never fault). Mask = a_src register; the
+     * lane's high bit selects. Load: dst<-mem (else 0). Store: mem<-b_src. */
+    if (d->op == VPMASKMOVD || d->op == VPMASKMOVQ) {
+        int lsz = (d->op == VPMASKMOVQ) ? 8 : 4;
+        int lanes = (d->wide ? 32 : 16) / lsz;
+        const uint8_t *mask = (const uint8_t *)rf->ymm[d->a_src];
+        uint64_t ea = ea_rf(d, rf, rip_next);
+        if (d->dst_kind == DST_MEM) {
+            const uint8_t *src = (const uint8_t *)rf->ymm[d->b_src];
+            for (int i = 0; i < lanes; i++) {
+                int sign = (lsz == 8) ? (((const int64_t *)mask)[i] < 0) : (((const int32_t *)mask)[i] < 0);
+                if (sign) mem_write(ea + (uint64_t)i * lsz, src + i * lsz, lsz, d->seg);
+            }
+        } else {
+            uint8_t out[32]; memset(out, 0, 32);
+            for (int i = 0; i < lanes; i++) {
+                int sign = (lsz == 8) ? (((const int64_t *)mask)[i] < 0) : (((const int32_t *)mask)[i] < 0);
+                if (sign) mem_read(out + i * lsz, ea + (uint64_t)i * lsz, lsz, d->seg);
+            }
+            memcpy(rf->ymm[d->dst], out, 16);
+            if (d->wide) memcpy(rf->ymm[d->dst] + 16, out + 16, 16);
+            else         memset(rf->ymm[d->dst] + 16, 0, 16);
+        }
+        return 1;
+    }
+
     ymm256 A, B, C, OUT; uint64_t gpr_out = 0;
     memset(&A,0,sizeof A); memset(&B,0,sizeof B); memset(&C,0,sizeof C);
     if ((d->a_src == OPND_MEM || d->b_src == OPND_MEM || d->dst_kind == DST_MEM)
@@ -307,8 +334,94 @@ static void chain(int sig, siginfo_t *info, void *uctx) {
     raise(sig);
 }
 
+/*
+ * cpuid faking. The target's no-AVX2 fallback path is broken (it spins), so we
+ * make cpuid advertise AVX2 + BMI1/BMI2 as present: the program then takes its
+ * AVX2 code path, whose faulting instructions the SIGILL handler emulates. We
+ * can't interpose cpuid (it's an instruction, not a call), so we rewrite each
+ * `0F A2` in the main image to `ud2`, record its address, and synthesise the
+ * result in on_sigill: run the real cpuid, then OR in / mask out feature bits.
+ * SET masks only add bits, so this is a no-op on a CPU that already has them.
+ */
+static uint64_t g_cpuid_addrs[16384];
+static int g_cpuid_count = 0;
+/* per-feature overrides applied to cpuid results: result = (real | set) & ~clr */
+static uint32_t g_l1ecx_set=0, g_l1ecx_clr=0, g_l7ebx_set=0, g_l7ebx_clr=0;
+
+static void avxemu_patch_cpuid(void){
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uint64_t text_addr=0, text_size=0;
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i=0;i<mh->ncmds;i++){
+        if (lc->cmd==LC_SEGMENT_64){
+            const struct segment_command_64 *sg=(const struct segment_command_64 *)lc;
+            if (!strcmp(sg->segname,"__TEXT")){
+                const struct section_64 *s=(const struct section_64 *)(sg+1);
+                for (uint32_t j=0;j<sg->nsects;j++) if(!strcmp(s[j].sectname,"__text")){ text_addr=s[j].addr; text_size=s[j].size; }
+            }
+        }
+        lc=(const struct load_command *)((const char *)lc+lc->cmdsize);
+    }
+    if (!text_addr) return;
+    uint8_t *text=(uint8_t *)(text_addr+slide), *end=text+text_size;
+    uintptr_t lo=(uintptr_t)text & ~(uintptr_t)0xfff, hi=((uintptr_t)text+text_size+0xfff)&~(uintptr_t)0xfff;
+    if (vm_protect(mach_task_self(),(vm_address_t)lo,(vm_size_t)(hi-lo),FALSE,
+                   VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)!=KERN_SUCCESS){ emit("avxemu: cpuid vm_protect failed\n"); return; }
+    uint8_t *p=text;
+    while (p<end){
+        int zk,off; int len=x86_len(p,end,&zk,&off);
+        if (len<=0) break;
+        if (len==2 && p[0]==0x0F && p[1]==0xA2){
+            if (g_cpuid_count < (int)(sizeof g_cpuid_addrs/sizeof g_cpuid_addrs[0])) g_cpuid_addrs[g_cpuid_count++]=(uint64_t)(uintptr_t)p;
+            p[0]=0x0F; p[1]=0x0B;   /* ud2 */
+        }
+        p+=len;
+    }
+    vm_protect(mach_task_self(),(vm_address_t)lo,(vm_size_t)(hi-lo),FALSE,VM_PROT_READ|VM_PROT_EXECUTE);
+}
+
+/* Map a feature token to its cpuid bit and OR it into the set or clr mask. */
+static void cpuid_feat(const char *name, int set){
+    uint32_t *l1 = set ? &g_l1ecx_set : &g_l1ecx_clr;
+    uint32_t *l7 = set ? &g_l7ebx_set : &g_l7ebx_clr;
+    if      (!strcmp(name,"avx"))   *l1 |= (1u<<28);
+    else if (!strcmp(name,"fma"))   *l1 |= (1u<<12);
+    else if (!strcmp(name,"movbe")) *l1 |= (1u<<22);
+    else if (!strcmp(name,"f16c"))  *l1 |= (1u<<29);
+    else if (!strcmp(name,"avx2"))  *l7 |= (1u<<5);
+    else if (!strcmp(name,"bmi1"))  *l7 |= (1u<<3);
+    else if (!strcmp(name,"bmi2"))  *l7 |= (1u<<8);
+    else if (!strcmp(name,"bmi"))   *l7 |= (1u<<3)|(1u<<8);
+    else if (!strcmp(name,"all")) { *l1 |= (1u<<28)|(1u<<12)|(1u<<22)|(1u<<29); *l7 |= (1u<<5)|(1u<<3)|(1u<<8); }
+}
+static void cpuid_parse(const char *spec, int set){
+    if (!spec) return;
+    char buf[64]; int bi=0;
+    for (const char *s=spec; ; s++){
+        if (*s==',' || *s=='\0'){ buf[bi]=0; if (bi) cpuid_feat(buf,set); bi=0; if (!*s) break; }
+        else if (bi < (int)sizeof buf-1) buf[bi++]=*s;
+    }
+}
+
 static void on_sigill(int sig, siginfo_t *info, void *uctx) {
     ucontext_t *uc = (ucontext_t *)uctx;
+    if (g_cpuid_count > 0) {                         /* cpuid trap check (before AVX-state read) */
+        _STRUCT_X86_THREAD_STATE64 *ss0 = &uc->uc_mcontext->__ss;
+        uint64_t rip0 = ss0->__rip;
+        int lo=0, hi=g_cpuid_count-1, found=0;
+        while (lo<=hi){ int mid=(lo+hi)>>1; uint64_t v=g_cpuid_addrs[mid];
+            if (v==rip0){found=1;break;} else if (v<rip0) lo=mid+1; else hi=mid-1; }
+        if (found){
+            uint32_t leaf=(uint32_t)ss0->__rax, sub=(uint32_t)ss0->__rcx, a,b,c,d;
+            __asm__ volatile("cpuid":"=a"(a),"=b"(b),"=c"(c),"=d"(d):"a"(leaf),"c"(sub));
+            if (leaf==1)                c = (c | g_l1ecx_set) & ~g_l1ecx_clr;
+            else if (leaf==7 && sub==0) b = (b | g_l7ebx_set) & ~g_l7ebx_clr;
+            ss0->__rax=a; ss0->__rbx=b; ss0->__rcx=c; ss0->__rdx=d; ss0->__rip+=2;
+            return;
+        }
+    }
     _STRUCT_XMM_REG *xmm, *ymmh; _STRUCT_X86_THREAD_STATE64 *ss;
     if (!read_mcontext_avx(uc, &xmm, &ymmh, &ss)) { chain(sig, info, uctx); return; }
 
@@ -401,6 +514,18 @@ static void avxemu_install(void) {
         return;
     }
     g_owned_sigill = 1;
+
+    /* Advertise AVX2 + BMI1/BMI2 through a trapped cpuid so the target program
+     * takes its AVX2 code path (whose faulting instructions we emulate) rather
+     * than its broken no-AVX2 fallback. The SET mask only ORs bits in, so on a
+     * CPU that genuinely has them this changes nothing. Env vars tune it for
+     * diagnostics; AVXEMU_CPUID_CLR wins over the default (clr is applied last). */
+    g_l7ebx_set |= (1u<<5) | (1u<<3) | (1u<<8);   /* avx2 | bmi1 | bmi2 */
+    { const char *fc = getenv("AVXEMU_FAKE_CPUID");
+      if (fc && *fc) cpuid_parse("all", (fc[1]=='f') ? 0 : 1); }   /* on => set all; off => clear all */
+    cpuid_parse(getenv("AVXEMU_CPUID_SET"), 1);
+    cpuid_parse(getenv("AVXEMU_CPUID_CLR"), 0);
+    if (g_l1ecx_set|g_l1ecx_clr|g_l7ebx_set|g_l7ebx_clr) avxemu_patch_cpuid();
 
     /* Rewrite lzcnt/tzcnt in the main binary to a faulting form so they get
      * emulated rather than silently running as bsr/bsf on a pre-Haswell CPU.

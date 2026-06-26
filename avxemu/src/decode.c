@@ -238,6 +238,11 @@ static int decode_inner(const uint8_t *p, decoded *d) {
         case 0x32: UNB(VPMOVZXBQ); d->mem_bytes=4; break;  case 0x33: UNB(VPMOVZXWD); d->mem_bytes=16; break;
         case 0x34: UNB(VPMOVZXWQ); d->mem_bytes=8; break;  case 0x35: UNB(VPMOVZXDQ); d->mem_bytes=16; break;
         case 0x13: UNB(VCVTPH2PS); d->mem_bytes=16; break;
+        /* AVX2 masked move: 8C load (reg<-mask,mem), 8E store (mem<-mask,reg). W: D/Q. */
+        case 0x8C: d->op = W?VPMASKMOVQ:VPMASKMOVD; d->dst=reg; d->dst_kind=DST_YMM;
+                   d->a_src=vvvv; d->b_src=(rm<0)?OPND_MEM:rm; d->mem_bytes=L?32:16; handled=1; break;
+        case 0x8E: d->op = W?VPMASKMOVQ:VPMASKMOVD; d->dst=OPND_MEM; d->dst_kind=DST_MEM;
+                   d->a_src=vvvv; d->b_src=reg; d->mem_bytes=L?32:16; handled=1; break;
         default:
             /* FMA: 96-9F / A6-AF / B6-BF */
             if ((opcode>=0x96&&opcode<=0x9F)||(opcode>=0xA6&&opcode<=0xAF)||(opcode>=0xB6&&opcode<=0xBF)) {

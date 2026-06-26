@@ -105,6 +105,12 @@ long avxemu_patch_lzcnt(void) {
     if (prev && prev >= text_addr && prev < text_addr + text_size)        /* last function */
         patched += lde_scan_func(text, prev - text_addr, text_size, readable, 1, res, 256);
 
+    /* Linear mop-up: the function-start recursive-descent scan never enters
+     * blocks unreachable from a function start (cold paths, tail regions the
+     * exports table doesn't bound). A final linear sweep catches the stragglers;
+     * sites already patched are now F0-prefixed and are skipped. */
+    { long lin = lde_scan_zcnt(text, (size_t)text_size, 1); if (lin > 0) patched += lin; }
+
     vm_protect(task, (vm_address_t)lo, (vm_size_t)(hi - lo), FALSE,
                VM_PROT_READ | VM_PROT_EXECUTE);
     return patched;

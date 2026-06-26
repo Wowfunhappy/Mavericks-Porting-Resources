@@ -38,6 +38,7 @@ static const char *const names[VEX_OP_COUNT] = {
     [VEXTRACTI128]="vextracti128",[VINSERTI128]="vinserti128",[VPERM2I128]="vperm2i128",
     [VPERMQ]="vpermq",[VPERMD]="vpermd",[VPERMPD]="vpermpd",[VPERMPS]="vpermps",
     [VCVTPH2PS]="vcvtph2ps",
+    [VPMASKMOVD]="vpmaskmovd",[VPMASKMOVQ]="vpmaskmovq",
     [VFMADD132]="vfmadd132",[VFMADD213]="vfmadd213",[VFMADD231]="vfmadd231",
     [VFMSUB132]="vfmsub132",[VFMSUB213]="vfmsub213",[VFMSUB231]="vfmsub231",
     [VFNMADD132]="vfnmadd132",[VFNMADD213]="vfnmadd213",[VFNMADD231]="vfnmadd231",
