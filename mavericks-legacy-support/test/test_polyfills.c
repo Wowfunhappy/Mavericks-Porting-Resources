@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <mach/mach_time.h>  /* mach_approximate_time, mach_continuous_time */
+#include <notify.h>          /* notify_is_valid_token */
 #include <os/lock.h>         /* os_unfair_lock */
 #include <sys/attr.h>        /* getattrlistat attrlist, VOL_CAP_INT_CLONE */
 #include <sys/clonefile.h>   /* clonefile */
@@ -255,6 +256,18 @@ main(void)
       fclose(f);
       free(bufp);
     }
+  }
+
+  /* ---- notify_is_valid_token ---- */
+  {
+    int tok = -1;
+    CHECK(notify_is_valid_token(0) == false);
+    CHECK(notify_is_valid_token(-1) == false);
+    CHECK(notify_register_check("org.mavericks-legacy-support.test.notify", &tok)
+          == NOTIFY_STATUS_OK);
+    CHECK(notify_is_valid_token(tok) == true);
+    CHECK(notify_cancel(tok) == NOTIFY_STATUS_OK);
+    CHECK(notify_is_valid_token(tok) == false);
   }
 
   /* ---- final cleanup ---- */
