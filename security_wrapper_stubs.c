@@ -26,36 +26,11 @@ void* SecCertificateCopyKey(SecCertificateRef cert) {
     return NULL;
 }
 
-/* Modern unified SecKey API (10.12+). Most return NULL — .NET's TLS path
- * doesn't strictly need them when SecTrustEvaluate proceeds with our
- * basic-X509 policy override. */
-CFDictionaryRef SecKeyCopyAttributes(SecKeyRef key) { (void)key; return NULL; }
-CFDataRef SecKeyCopyExternalRepresentation(SecKeyRef key, CFErrorRef *e) {
-    (void)key; if (e) *e = NULL; return NULL;
-}
-CFDataRef SecKeyCopyKeyExchangeResult(SecKeyRef p, CFStringRef a, SecKeyRef pu,
-                                       CFDictionaryRef ps, CFErrorRef *e) {
-    (void)p; (void)a; (void)pu; (void)ps; if (e) *e = NULL; return NULL;
-}
-SecKeyRef SecKeyCopyPublicKey(SecKeyRef key) { (void)key; return NULL; }
-CFDataRef SecKeyCreateDecryptedData(SecKeyRef k, CFStringRef a, CFDataRef c, CFErrorRef *e) {
-    (void)k; (void)a; (void)c; if (e) *e = NULL; return NULL;
-}
-CFDataRef SecKeyCreateEncryptedData(SecKeyRef k, CFStringRef a, CFDataRef c, CFErrorRef *e) {
-    (void)k; (void)a; (void)c; if (e) *e = NULL; return NULL;
-}
-SecKeyRef SecKeyCreateRandomKey(CFDictionaryRef p, CFErrorRef *e) {
-    (void)p; if (e) *e = NULL; return NULL;
-}
-CFDataRef SecKeyCreateSignature(SecKeyRef k, CFStringRef a, CFDataRef d, CFErrorRef *e) {
-    (void)k; (void)a; (void)d; if (e) *e = NULL; return NULL;
-}
-SecKeyRef SecKeyCreateWithData(CFDataRef d, CFDictionaryRef a, CFErrorRef *e) {
-    (void)d; (void)a; if (e) *e = NULL; return NULL;
-}
-Boolean SecKeyVerifySignature(SecKeyRef k, CFStringRef a, CFDataRef sd, CFDataRef s, CFErrorRef *e) {
-    (void)k; (void)a; (void)sd; (void)s; if (e) *e = NULL; return false;
-}
+/* Modern unified SecKey API (10.12+): implemented for real (OpenSSL-backed)
+ * in security_seckey_rsa.c — .NET's RSA operations (e.g. encrypting a Steam
+ * login password with the server's public key) go through these, so NULL
+ * stubs here would surface as "Error occurred during a cryptographic
+ * operation." The algorithm/attribute constants below stay in this file. */
 
 /* Algorithm / attribute constants */
 const CFStringRef kSecAttrKeyTypeECSECPrimeRandom = CFSTR("SecAttrKeyTypeECSECPrimeRandom");
