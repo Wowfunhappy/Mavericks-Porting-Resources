@@ -74,6 +74,28 @@ ones pull in **Security**, **CoreFoundation**, and **libobjc**, which the
 Makefile links into the dylibs (`WFHLIBS`); static-lib consumers must link
 those frameworks themselves.
 
+This group also absorbed the libSystem shims that used to live in a standalone
+`modern_api_polyfills.c` (built for the Claude Code / Bun port). They share the
+`src/mav_shim_debug.h` helper (runtime tracing via `MAV_PATCH_DEBUG=1`) and fall
+into two kinds:
+
+* **Gap-fillers** — provide a symbol 10.9 lacks entirely: `src/ulock.c`
+  (`__ulock_wait{,2}`/`__ulock_wake`), `src/mkostemp.c`,
+  `src/posix_spawn_chdir.c`, `src/msg_x.c` (`recvmsg_x`/`sendmsg_x`),
+  `src/preadv_pwritev_nocancel.c`, `src/renameatx_np.c`, `src/timingsafe_bcmp.c`,
+  `src/fd_set_overflow.c`, `src/chk_fail.c`, `src/signpost.c`,
+  `src/os_unfair_lock_assert.c`, `src/pthread_self_is_exiting.c`.
+* **Behavioral overrides** — replace a symbol that *does* exist on 10.9 to fix
+  broken/absent modern behavior: `src/kevent64_shim.c` (modern kqueue
+  `KEVENT_FLAG_ERROR_EVENTS` / `EVFILT_MACHPORT` semantics, plus `socket`/
+  `connect` trace hooks), `src/dlopen_interpose.c` (rewrites `.node`
+  add-ons' libSystem `LC_LOAD_DYLIB` to this wrapper), `src/write_underline.c`
+  (cancels a 10.9 Terminal underline misparse), `src/ioctl_winsize.c`
+  (`TIOCGWINSZ` fd-0 fallback). Because these override existing symbols, a
+  consumer that plain-links the archive won't pull them (nothing is undefined);
+  they activate only under `-force_load` (or the `system-lib` dylib), which is
+  exactly how `libSystemWrapper` interposes them.
+
 ## Building & installing
 
 ```sh

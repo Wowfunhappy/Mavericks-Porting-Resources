@@ -2,7 +2,7 @@
 set -e
 
 APP="Ex-Zodiac.app/Contents/MacOS"
-LEGACY_STATIC="/Users/Jonathan/Developer/MacPorts-Legacy-Support/lib/libMacportsLegacySupport.a"
+LEGACY_STATIC="/Users/Jonathan/Developer/Mavericks Porting Resources/mavericks-legacy-support/lib/libMavericksLegacySupport.a"
 
 echo "=== Building framework wrappers ==="
 
@@ -214,13 +214,15 @@ clang -dynamiclib -o "$APP/libCoreFoundationWrapper.dylib" \
 echo "  CoreFoundation wrapper: OK"
 
 # ── libSystem wrapper (re-export + legacy support) ──
-# Use the MacPorts Legacy Support library's approach
+# Force-loads MavericksLegacySupport (the single source of truth for 10.9
+# libSystem polyfills — includes the ulock/kevent/dlopen/write shims). Its
+# launchservices.o needs CoreServices at link time.
 clang -dynamiclib -o "$APP/libSystemWrapper.dylib" \
   -Wl,-reexport_library,/usr/lib/libSystem.B.dylib \
   -Wl,-force_load,"$LEGACY_STATIC" \
   -install_name "@loader_path/libSystemWrapper.dylib" \
   -compatibility_version 1.0.0 -current_version 1356.0.0 \
-  -framework CoreFoundation -framework Security -framework CoreVideo -framework CoreGraphics -lobjc \
+  -framework CoreFoundation -framework Security -framework CoreVideo -framework CoreGraphics -framework CoreServices -lobjc \
   -Wno-deprecated-declarations 2>&1
 echo "  libSystem wrapper: OK"
 

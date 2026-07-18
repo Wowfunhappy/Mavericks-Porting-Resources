@@ -1,9 +1,11 @@
 /*
  * Polyfills required by .NET 9 NativeAOT / SingleFile binaries on macOS 10.9.
  *
- * Drop into libSystemWrapper alongside modern_api_polyfills.c (or build as a
- * separate dylib reachable via the binary's libSystem-rewritten LC_LOAD_DYLIB)
- * to make .NET's coreclr/PAL initialise.
+ * These belong in mavericks-legacy-support (the single source of truth for
+ * 10.9 libSystem polyfills; see its src/*.c) — fold them in there when a .NET
+ * target needs them, rather than keeping this as a separate inline shim. Until
+ * then they can also be built into libSystemWrapper or a separate dylib
+ * reachable via the binary's libSystem-rewritten LC_LOAD_DYLIB.
  *
  * The interposes here are the ones whose presence/behavior on 10.10+ vs 10.9
  * specifically gate .NET startup. They are individually small but failure of
@@ -139,7 +141,8 @@ kern_return_t vm_remap_wrap(
 }
 
 /* preadv/pwritev — added in 10.10. Emulate via pread/pwrite. The $NOCANCEL
- * variants are in modern_api_polyfills.c; this covers the plain symbols. */
+ * variants are in mavericks-legacy-support (src/preadv_pwritev_nocancel.c);
+ * this covers the plain symbols. */
 #include <sys/uio.h>
 ssize_t preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
     ssize_t total = 0;
