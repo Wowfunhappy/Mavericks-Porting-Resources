@@ -135,6 +135,48 @@ static void test_invariant_addresses_preserved(void) {
               i, (unsigned long long)got[i], (unsigned long long)addrs[i]);
 }
 
+/* ---- __TEXT,__init_offsets re-base ----
+ * Same bug class as the function-starts delta: entries are offsets from the
+ * mach header, so lowering the base leaves them all `grow` too small. Driven
+ * against a synthetic image because the 10.9 toolchain can't emit an
+ * __init_offsets section to build a fixture from; the end-to-end proof is a
+ * grown Claude Code binary reaching its entry point (see the commit message). */
+static void test_init_offsets_rebase(void) {
+    static uint8_t img[8192];
+    memset(img, 0, sizeof img);
+    struct mach_header_64 *h = (struct mach_header_64 *)img;
+    h->magic = MH_MAGIC_64;
+    h->ncmds = 1;
+    struct segment_command_64 *seg = (struct segment_command_64 *)(img + sizeof *h);
+    seg->cmd = LC_SEGMENT_64;
+    seg->cmdsize = sizeof(*seg) + sizeof(struct section_64);
+    strcpy(seg->segname, "__TEXT");
+    seg->nsects = 1;
+    h->sizeofcmds = seg->cmdsize;
+    struct section_64 *s = (struct section_64 *)((uint8_t *)seg + sizeof *seg);
+    strncpy(s->sectname, "__init_offsets", sizeof s->sectname);
+    strncpy(s->segname, "__TEXT", sizeof s->segname);
+    s->offset = 4096;
+    s->size = 3 * sizeof(uint32_t);
+    uint32_t *e = (uint32_t *)(img + 4096);
+    e[0] = 0x1000; e[1] = 0x2000; e[2] = 0x3000;
+
+    CHECK(mg_rebase_init_offsets(img, 0x1000) == 0, "init_offsets rebase returns 0");
+    CHECK(e[0] == 0x2000 && e[1] == 0x3000 && e[2] == 0x4000,
+          "every entry gained grow (got %u %u %u)", e[0], e[1], e[2]);
+
+    /* A section that isn't __init_offsets must be left alone. */
+    strncpy(s->sectname, "__text", sizeof s->sectname);
+    e[0] = 0x1000;
+    CHECK(mg_rebase_init_offsets(img, 0x1000) == 0 && e[0] == 0x1000,
+          "other sections untouched (got %u)", e[0]);
+
+    /* An entry that would wrap is refused rather than silently truncated. */
+    strncpy(s->sectname, "__init_offsets", sizeof s->sectname);
+    e[0] = 0xffffffffu;
+    CHECK(mg_rebase_init_offsets(img, 0x1000) == -1, "overflowing entry refused");
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -144,6 +186,7 @@ int main(void) {
     test_reencode_nonminimal_original_preserved();
     test_reencode_malformed();
     test_invariant_addresses_preserved();
+    test_init_offsets_rebase();
     if (fails) { printf("macho_grow_test: %d FAILURE(S)\n", fails); return 1; }
     printf("macho_grow_test: all cases pass\n");
     return 0;
