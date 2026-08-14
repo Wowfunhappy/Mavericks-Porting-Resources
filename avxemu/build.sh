@@ -133,10 +133,18 @@ fi
 
 echo "[8] self-test via the dylib path (AVXEMU_SELFTEST)..."
 "$CC" -dynamiclib -O2 -msse4.2 -mno-avx -mno-fma \
-    -install_name "\$HOME/.local/share/claude-mavericks/libavxemu.dylib" \
+    -install_name "@rpath/libavxemu.dylib" \
     $PURE $ASM -o "$OUT/libavxemu.dylib"
 AVXEMU_SELFTEST=1 DYLD_INSERT_LIBRARIES="$OUT/libavxemu.dylib" /usr/bin/true || \
     { echo "    self-test FAILED"; exit 1; }
+
+echo "[8i] linked (not inserted): avxemu keeps SIGILL via its own rebind..."
+# Linked against the dylib on purpose: dyld only honours __DATA,__interpose for
+# DYLD_INSERT_LIBRARIES images, so this is the path where handler.c has to
+# rebind sigaction/signal itself. Second run is the negative control.
+"$CC" -O0 test/linkhook.c "$OUT/libavxemu.dylib" -Wl,-rpath,"$OUT" -o "$OUT/linkhook"
+"$OUT/linkhook"                   || { echo "    linked-load rebind FAILED"; exit 1; }
+AVXEMU_NO_REBIND=1 "$OUT/linkhook" || { echo "    negative control FAILED"; exit 1; }
 
 echo "[8a] runtime fault handler: SIMD over-read fixup + guard-page safety..."
 "$CC" -O0 test/overread_fault.c -o "$OUT/overread_fault"

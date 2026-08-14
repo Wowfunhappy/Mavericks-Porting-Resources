@@ -695,6 +695,137 @@ __attribute__((used)) static const struct { const void *r, *o; }
   _interpose_signal __attribute__((section("__DATA,__interpose"))) =
     { (const void*)avxemu_signal, (const void*)signal };
 
+/*
+ * Fallback interposition, for when dyld won't do it for us.
+ *
+ * 10.9's dyld registers __DATA,__interpose ONLY for DYLD_INSERT_LIBRARIES
+ * images. Baked into a binary as a plain LC_LOAD_DYLIB — the tidier way to
+ * attach the emulator, since it then cannot leak into child processes — the
+ * overrides above are silently ignored: the runtime's crash reporter takes
+ * SIGILL and the first emulated instruction becomes an "illegal instruction"
+ * crash report. (Observed exactly that with Claude Code: Bun's crash banner,
+ * then a hang.)
+ *
+ * So produce dyld's end state by hand. For each image, walk the lazy and
+ * non-lazy symbol pointer sections through the indirect symbol table and
+ * repoint the sigaction/signal slots at ours. Idempotent, so it costs nothing
+ * when dyld did interpose — those slots already hold our addresses and are
+ * skipped. AVXEMU_NO_REBIND=1 opts out.
+ *
+ * Deliberately not touched: our own image, and the system libraries under
+ * /usr/lib and /System. The runtime and whatever it bundles are what install
+ * crash handlers; rewriting libsystem's own call sites buys nothing and is a
+ * good way to find a reentrancy problem.
+ */
+/* Our own image's mach header, found by asking which loaded image contains one
+ * of our own functions.
+ *
+ * Not _mh_dylib_header: the linker defines that only for MH_DYLIB output, so a
+ * reference to it fails to link every test target that pulls handler.o into an
+ * executable ("Undefined symbols: __mh_dylib_header"). Neither weak_import nor
+ * weak rescues it -- both still need the symbol to exist somewhere. dladdr()
+ * would be the obvious alternative, but it and Dl_info are Darwin extensions
+ * that this file's strict _XOPEN_SOURCE hides (same trap as MAP_ANON above).
+ * The dyld image APIs are already in use here and are not hidden, so use those. */
+static const struct mach_header_64 *avxemu_self_header(void) {
+    static const struct mach_header_64 *self;
+    static int done;
+    if (done) return self;
+    done = 1;
+    const uintptr_t me = (uintptr_t)&avxemu_self_header;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh || mh->magic != MH_MAGIC_64) continue;
+        const intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const struct load_command *lc = (const struct load_command *)(mh + 1);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *sg =
+                    (const struct segment_command_64 *)lc;
+                const uintptr_t lo = (uintptr_t)sg->vmaddr + (uintptr_t)slide;
+                if (me >= lo && me < lo + (uintptr_t)sg->vmsize) { self = mh; break; }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+        if (self) break;
+    }
+    return self;
+}
+
+static int rebind_sym_in_image(const struct mach_header_64 *mh, intptr_t slide,
+                               const char *want, const void *repl) {
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    const struct symtab_command *st = 0;
+    const struct dysymtab_command *dy = 0;
+    uintptr_t le_base = 0;
+
+    for (uint32_t c = 0; c < mh->ncmds; c++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (!strcmp(sg->segname, "__LINKEDIT"))
+                le_base = (uintptr_t)slide + (uintptr_t)sg->vmaddr - (uintptr_t)sg->fileoff;
+        } else if (lc->cmd == LC_SYMTAB) {
+            st = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dy = (const struct dysymtab_command *)lc;
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    if (!st || !dy || !le_base || !dy->nindirectsyms) return 0;
+
+    const struct nlist_64 *syms = (const struct nlist_64 *)(le_base + st->symoff);
+    const char *strs = (const char *)(le_base + st->stroff);
+    const uint32_t *indirect = (const uint32_t *)(le_base + dy->indirectsymoff);
+
+    int n = 0;
+    lc = (const struct load_command *)(mh + 1);
+    for (uint32_t c = 0; c < mh->ncmds; c++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sect = (const struct section_64 *)(sg + 1);
+            for (uint32_t s = 0; s < sg->nsects; s++) {
+                uint32_t type = sect[s].flags & SECTION_TYPE;
+                if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS)
+                    continue;
+                const void **slot = (const void **)((uintptr_t)slide + (uintptr_t)sect[s].addr);
+                uint32_t nslots = (uint32_t)(sect[s].size / sizeof(void *));
+                for (uint32_t k = 0; k < nslots; k++) {
+                    uint32_t si = indirect[sect[s].reserved1 + k];
+                    if (si >= dy->nindirectsyms + dy->indirectsymoff) continue;
+                    if (si & (INDIRECT_SYMBOL_ABS | INDIRECT_SYMBOL_LOCAL)) continue;
+                    if (si >= st->nsyms) continue;
+                    const char *nm = strs + syms[si].n_un.n_strx;
+                    if (strcmp(nm, want)) continue;
+                    if (slot[k] == repl) continue;          /* dyld already did it */
+                    uintptr_t page = (uintptr_t)&slot[k] & ~(uintptr_t)(PAGE_SIZE - 1);
+                    if (mprotect((void *)page, PAGE_SIZE, PROT_READ | PROT_WRITE) != 0)
+                        continue;
+                    slot[k] = repl;
+                    n++;
+                }
+            }
+        }
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    return n;
+}
+
+static void avxemu_rebind_image(const struct mach_header *mhp, intptr_t slide) {
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)mhp;
+    if (!mh || mh->magic != MH_MAGIC_64) return;
+    if (mh == avxemu_self_header()) return;                 /* never ourselves */
+
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if ((const struct mach_header_64 *)_dyld_get_image_header(i) != mh) continue;
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && (!strncmp(nm, "/usr/lib/", 9) || !strncmp(nm, "/System/", 8))) return;
+        break;
+    }
+    rebind_sym_in_image(mh, slide, "_sigaction", (const void *)avxemu_sigaction);
+    rebind_sym_in_image(mh, slide, "_signal",    (const void *)avxemu_signal);
+}
+
 __attribute__((constructor))
 static void avxemu_install(void) {
     if (getenv("AVXEMU_DISABLE")) return;     /* opt-out escape hatch */
@@ -708,6 +839,12 @@ static void avxemu_install(void) {
         return;
     }
     g_owned_sigill = 1;
+
+    /* Keep that ownership even when dyld won't interpose for us (see above).
+     * Registering fires the callback for every image already loaded and for
+     * each one loaded later, so dlopened plugins are covered too. */
+    if (!getenv("AVXEMU_NO_REBIND"))
+        _dyld_register_func_for_add_image(avxemu_rebind_image);
 
     /* Fault-driven relocation is on by default; AVXEMU_RELOC=0 disables it so the
      * A/B harness can compare emulate-only vs relocate. */
