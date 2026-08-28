@@ -41,3 +41,39 @@ extern id objc_retainAutoreleasedReturnValue(id obj);
 id objc_unsafeClaimAutoreleasedReturnValue(id obj) {
 	return objc_retainAutoreleasedReturnValue(obj);
 }
+
+/*
+ * objc_loadClassref resolves a lazy class reference. The compiler emits these
+ * for a class it can only name at runtime: the slot holds either the class
+ * itself, or -- with the low bit set -- a pointer to a stub function that
+ * returns the class. This is the documented protocol, implemented rather than
+ * stubbed, because the caller uses whatever comes back as a Class.
+ */
+Class objc_loadClassref(void **ref) {
+    if (!ref) return Nil;
+    uintptr_t slot = (uintptr_t)*ref;
+    if (slot & 1) {
+        Class (*resolver)(void) = (Class (*)(void))(slot & ~(uintptr_t)1);
+        Class cls = resolver();
+        *ref = (void *)cls;     /* memoise, as the runtime does */
+        return cls;
+    }
+    return (Class)slot;
+}
+
+/*
+ * The compiler emits these two in place of ordinary message sends when the
+ * deployment target is new enough. Both have exact semantics, so both are
+ * implemented rather than stubbed.
+ */
+
+/* [Cls new] */
+id objc_opt_new(Class cls) {
+    id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+    return cls ? send((id)cls, sel_registerName("new")) : nil;
+}
+
+/* [obj self], which is the object itself. */
+id objc_opt_self(id object) {
+    return object;
+}

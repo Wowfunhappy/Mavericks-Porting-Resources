@@ -229,3 +229,45 @@ const CFStringRef kSecKeyAlgorithmRSASignatureDigestPSSSHA256 = CFSTR("algid:sig
 const CFStringRef kSecKeyAlgorithmRSASignatureDigestPSSSHA384 = CFSTR("algid:sign:RSA:digest-PSS:SHA384");
 const CFStringRef kSecKeyAlgorithmRSASignatureDigestPSSSHA512 = CFSTR("algid:sign:RSA:digest-PSS:SHA512");
 const CFStringRef kSecKeyAlgorithmRSASignatureRaw = CFSTR("algid:sign:RSA:raw");
+
+/*
+ * ── Later Security.framework entry points ──
+ *
+ * These name facilities 10.9 has no implementation of at all: Certificate
+ * Transparency (SCTs), the sec_protocol_* object family introduced with
+ * Network.framework, and the policy-taking CMS timestamp accessor. Each
+ * reports failure in the terms its own API uses, so a caller that checks the
+ * result takes its unsupported path. None of them fabricates a success, which
+ * for a trust-evaluation API would be the one truly dangerous outcome.
+ */
+
+/* Code Signing guest attribute key; the value is the documented one. */
+const CFStringRef kSecGuestAttributeAudit = CFSTR("audit");
+
+OSStatus CMSDecoderCopySignerTimestampWithPolicy(void *cmsDecoder, void *timeStampPolicy,
+                                                 size_t signerIndex, CFAbsoluteTime *timestamp) {
+    (void)cmsDecoder; (void)timeStampPolicy; (void)signerIndex;
+    if (timestamp) *timestamp = 0;
+    return errSecUnimplemented;
+}
+
+/* Certificate Transparency arrived in 10.13. 10.9's trust evaluator cannot
+ * consume SCTs, so accepting them silently would imply a check that never
+ * happens. */
+OSStatus SecTrustSetSignedCertificateTimestamps(SecTrustRef trust, CFArrayRef sctArray) {
+    (void)trust; (void)sctArray;
+    return errSecUnimplemented;
+}
+
+/* sec_trust_t / sec_protocol_metadata_t are Network.framework object types
+ * that do not exist here, so there is never one to unwrap. */
+SecTrustRef sec_trust_copy_ref(void *sec_trust) {
+    (void)sec_trust;
+    return NULL;
+}
+
+bool sec_protocol_metadata_access_ocsp_response(void *metadata,
+                                                bool (^handler)(void *response)) {
+    (void)metadata; (void)handler;
+    return false;   /* no OCSP responses were delivered */
+}

@@ -1,5 +1,5 @@
 /*
- * Rewrite LC_LOAD_DYLIB paths.
+ * Rewrite LC_LOAD_DYLIB and LC_RPATH paths.
  *
  * By default the new load commands must fit in the header padding between the
  * last load command and the first section's file data; if they don't, the tool
@@ -8,7 +8,9 @@
  * rejected otherwise.
  *
  * Usage: change_dylib input [-grow] [-change old new] [-delete path]
- *                     [-reexport path] [-add path] [-strip-lc name]...
+ *                     [-reexport path] [-add path] [-strip-lc name]
+ *                     [-change-rpath old new] [-delete-rpath path]
+ *                     [-add-rpath path]...
  *
  * -strip-lc drops a whole load command by kind (uuid, codesig, source-version,
  * build-version, code-sign-drs). It reclaims header padding without moving any
@@ -19,6 +21,11 @@
  * guarantee header room). Used to bake a dependency — e.g. libavxemu.dylib —
  * into the binary itself, so only that binary loads it (not children inheriting
  * DYLD_INSERT_LIBRARIES). See HEADER_PAD_GROWTH.md.
+ *
+ * The -*-rpath forms do the same three operations on LC_RPATH. A binary whose
+ * @rpath/ dependencies must resolve somewhere new needs its search paths moved
+ * as well as its load paths, and the two travel together often enough that
+ * splitting them across two tools is a nuisance.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,6 +74,8 @@ struct change {
 static void build_lcs(const uint8_t *buf, const struct change *changes, int nchanges,
                       const char *const *adds, int nadds,
                       const uint32_t *strip, int nstrip,
+                      const struct change *rchanges, int nrchanges,
+                      const char *const *radds, int nradds,
                       uint8_t *new_lcs, uint32_t *out_off, uint32_t *out_ncmds,
                       int *out_mods, int verbose) {
     const struct mach_header_64 *hdr = (const struct mach_header_64 *)buf;
@@ -111,7 +120,42 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
             }
         }
 
-        if (matched >= 0 && changes[matched].new_path == NULL) {
+        /* LC_RPATH carries a single lc_str exactly like a dylib command, so
+         * the same grow-the-command-and-rewrite-in-place logic applies. */
+        int rmatched = -1;
+        if (lc->cmd == LC_RPATH) {
+            const struct rpath_command *rc = (const struct rpath_command *)lcp;
+            const char *rp = (const char *)lcp + rc->path.offset;
+            for (int c = 0; c < nrchanges; c++)
+                if (strcmp(rp, rchanges[c].old_path) == 0) { rmatched = c; break; }
+            if (rmatched >= 0 && rchanges[rmatched].new_path != NULL) {
+                size_t base = rc->path.offset;
+                size_t new_len = strlen(rchanges[rmatched].new_path) + 1;
+                uint32_t needed = (uint32_t)((base + new_len + 7) & ~7UL);
+                if (needed < cmdsize) needed = cmdsize;
+                write_size = needed;
+            }
+        }
+
+        if (rmatched >= 0) {
+            if (rchanges[rmatched].new_path == NULL) {
+                if (verbose) printf("  Delete rpath [%u bytes]: %s\n", cmdsize,
+                                    rchanges[rmatched].old_path);
+                ncmds--;
+            } else {
+                memcpy(new_lcs + new_off, lcp, cmdsize);
+                struct rpath_command *nrc = (struct rpath_command *)(new_lcs + new_off);
+                nrc->cmdsize = write_size;
+                size_t base = nrc->path.offset;
+                memset(new_lcs + new_off + base, 0, write_size - base);
+                strcpy((char *)(new_lcs + new_off + base), rchanges[rmatched].new_path);
+                if (verbose)
+                    printf("  Change rpath [%u->%u bytes]: %s -> %s\n", cmdsize, write_size,
+                           rchanges[rmatched].old_path, rchanges[rmatched].new_path);
+                new_off += write_size;
+            }
+            mods++;
+        } else if (matched >= 0 && changes[matched].new_path == NULL) {
             if (verbose) printf("  Delete [%u bytes]: %s\n", cmdsize, changes[matched].old_path);
             ncmds--;
             mods++;
@@ -160,6 +204,23 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
         if (verbose) printf("  Add [%u bytes]: LC_LOAD_DYLIB %s\n", cs, adds[a]);
     }
 
+    /* Append brand-new LC_RPATH commands (-add-rpath): an rpath_command
+     * followed by the NUL-terminated path, padded to 8 bytes. */
+    for (int a = 0; a < nradds; a++) {
+        size_t plen = strlen(radds[a]) + 1;
+        uint32_t cs = (uint32_t)((sizeof(struct rpath_command) + plen + 7) & ~7UL);
+        struct rpath_command *nrc = (struct rpath_command *)(new_lcs + new_off);
+        memset(nrc, 0, cs);
+        nrc->cmd = LC_RPATH;
+        nrc->cmdsize = cs;
+        nrc->path.offset = sizeof(struct rpath_command);
+        strcpy((char *)nrc + sizeof(struct rpath_command), radds[a]);
+        new_off += cs;
+        ncmds++;
+        mods++;
+        if (verbose) printf("  Add [%u bytes]: LC_RPATH %s\n", cs, radds[a]);
+    }
+
     *out_off = new_off;
     *out_ncmds = ncmds;
     *out_mods = mods;
@@ -168,7 +229,9 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
 int main(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Usage: %s input [-grow] [-change old new] [-delete path] "
-                        "[-reexport path] [-add path] [-strip-lc name] ...\n", argv[0]);
+                        "[-reexport path] [-add path] [-strip-lc name] "
+                        "[-change-rpath old new] [-delete-rpath path] "
+                        "[-add-rpath path] ...\n", argv[0]);
         fprintf(stderr, "  -strip-lc kinds:");
         for (size_t k = 0; k < sizeof(strippable)/sizeof(strippable[0]); k++)
             fprintf(stderr, " %s", strippable[k].name);
@@ -181,6 +244,10 @@ int main(int argc, char **argv) {
     int nchanges = 0;
     const char *adds[32];
     int nadds = 0;
+    struct change rchanges[32];
+    int nrchanges = 0;
+    const char *radds[32];
+    int nradds = 0;
     int allow_grow = 0;
     uint32_t strip[16];
     int nstrip = 0;
@@ -217,6 +284,21 @@ int main(int argc, char **argv) {
             changes[nchanges].reexport = 1;
             nchanges++;
             i += 2;
+        } else if (strcmp(argv[i], "-add-rpath") == 0 && i + 1 < argc) {
+            radds[nradds++] = argv[i+1];
+            i += 2;
+        } else if (strcmp(argv[i], "-change-rpath") == 0 && i + 2 < argc) {
+            rchanges[nrchanges].old_path = argv[i+1];
+            rchanges[nrchanges].new_path = argv[i+2];
+            rchanges[nrchanges].reexport = 0;
+            nrchanges++;
+            i += 3;
+        } else if (strcmp(argv[i], "-delete-rpath") == 0 && i + 1 < argc) {
+            rchanges[nrchanges].old_path = argv[i+1];
+            rchanges[nrchanges].new_path = NULL;
+            rchanges[nrchanges].reexport = 0;
+            nrchanges++;
+            i += 2;
         } else { fprintf(stderr, "bad arg: %s\n", argv[i]); return 1; }
     }
 
@@ -241,11 +323,14 @@ int main(int argc, char **argv) {
     uint32_t add_bytes = 0;
     for (int a = 0; a < nadds; a++)
         add_bytes += (uint32_t)((sizeof(struct dylib_command) + strlen(adds[a]) + 1 + 7) & ~7UL);
+    for (int a = 0; a < nradds; a++)
+        add_bytes += (uint32_t)((sizeof(struct rpath_command) + strlen(radds[a]) + 1 + 7) & ~7UL);
 
     /* Build the new table once to learn its size (and print diagnostics). */
     uint8_t *new_lcs = calloc(1, first_sect_off + add_bytes + 64);
     uint32_t new_off, new_ncmds; int modifications;
-    build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, new_lcs, &new_off, &new_ncmds, &modifications, 1);
+    build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, rchanges, nrchanges,
+              radds, nradds, new_lcs, &new_off, &new_ncmds, &modifications, 1);
 
     if (modifications == 0) { printf("Nothing to change.\n"); return 0; }
 
@@ -276,7 +361,8 @@ int main(int argc, char **argv) {
          * the copied load commands reflect the shift. */
         free(new_lcs);
         new_lcs = calloc(1, first_sect_off + add_bytes + 64);
-        build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, new_lcs, &new_off, &new_ncmds, &modifications, 0);
+        build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, rchanges, nrchanges,
+                  radds, nradds, new_lcs, &new_off, &new_ncmds, &modifications, 0);
     }
 
     /* Commit: zero the whole LC area, write the new table, fix up the header. */

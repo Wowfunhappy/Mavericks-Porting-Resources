@@ -1,4 +1,4 @@
-// Wrapper for Foundation on OS X 10.9: supplies the symbols this OS's copy
+// Wrapper for CoreGraphics on OS X 10.9: supplies the symbols this OS's copy
 // lacks, and re-exports the real one so everything else still resolves.
 // Hand-written: the class list started from the symbols real binaries bind,
 // but the constants and functions carry real values and implementations,
@@ -31,24 +31,19 @@
     @implementation name \
     EH_STUB_FORWARDING \
     @end
-STUB_CLASS(NSDateComponentsFormatter)
-STUB_CLASS(NSPresentationIntent)
-STUB_CLASS(NSURLQueryItem)
-
-// Data constants. Where the real value is documented it is reproduced
-// exactly, because callers compare and serialise these.
-NSString * const NSPresentationIntentAttributeName = @"NSPresentationIntent";
 
 // ---- hand-written ----
 
-// NSEdgeInsets exists on 10.9; these two helpers do not.
-const NSEdgeInsets NSEdgeInsetsZero = {0.0, 0.0, 0.0, 0.0};
-
-BOOL NSEdgeInsetsEqual(NSEdgeInsets a, NSEdgeInsets b) {
-    return a.top == b.top && a.left == b.left &&
-           a.bottom == b.bottom && a.right == b.right;
+// No Metal on 10.9, so no display has a Metal device. NULL is the same answer
+// a real Mac without a Metal-capable GPU gives.
+void *CGDirectDisplayCopyCurrentMetalDevice(CGDirectDisplayID display) {
+    (void)display; return NULL;
 }
 
-// Kept from an earlier port: a file-protection class that has no effect on
-// 10.9 (there is no data protection), but whose symbol binaries still bind.
-NSString * const NSFileProtectionComplete = @"NSFileProtectionComplete";
+// 10.9 posts events to a process by Carbon PSN. The pid form is newer, but the
+// translation is available, so this is a real implementation.
+void CGEventPostToPid(pid_t pid, CGEventRef event) {
+    if (!event) return;
+    ProcessSerialNumber psn = {0, kNoProcess};
+    if (GetProcessForPID(pid, &psn) == noErr) CGEventPostToPSN(&psn, event);
+}

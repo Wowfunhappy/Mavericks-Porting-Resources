@@ -1,4 +1,4 @@
-// Wrapper for Foundation on OS X 10.9: supplies the symbols this OS's copy
+// Wrapper for CoreServices on OS X 10.9: supplies the symbols this OS's copy
 // lacks, and re-exports the real one so everything else still resolves.
 // Hand-written: the class list started from the symbols real binaries bind,
 // but the constants and functions carry real values and implementations,
@@ -31,24 +31,24 @@
     @implementation name \
     EH_STUB_FORWARDING \
     @end
-STUB_CLASS(NSDateComponentsFormatter)
-STUB_CLASS(NSPresentationIntent)
-STUB_CLASS(NSURLQueryItem)
-
-// Data constants. Where the real value is documented it is reproduced
-// exactly, because callers compare and serialise these.
-NSString * const NSPresentationIntentAttributeName = @"NSPresentationIntent";
 
 // ---- hand-written ----
 
-// NSEdgeInsets exists on 10.9; these two helpers do not.
-const NSEdgeInsets NSEdgeInsetsZero = {0.0, 0.0, 0.0, 0.0};
-
-BOOL NSEdgeInsetsEqual(NSEdgeInsets a, NSEdgeInsets b) {
-    return a.top == b.top && a.left == b.left &&
-           a.bottom == b.bottom && a.right == b.right;
+// The plural form (10.15) returns every app registered for a bundle id. 10.9's
+// LaunchServices can answer for one, so this returns a one-element array rather
+// than nothing -- callers use the first entry.
+CFArrayRef LSCopyApplicationURLsForBundleIdentifier(CFStringRef bundleID, CFErrorRef *outError) {
+    if (outError) *outError = NULL;
+    if (!bundleID) return NULL;
+    CFURLRef single = NULL;
+    OSStatus status = LSFindApplicationForInfo(kLSUnknownCreator, bundleID, NULL, NULL, &single);
+    if (status == noErr && single) {
+        const void *values[1] = { single };
+        CFArrayRef urls = CFArrayCreate(kCFAllocatorDefault, values, 1, &kCFTypeArrayCallBacks);
+        CFRelease(single);
+        return urls;
+    }
+    if (outError)
+        *outError = CFErrorCreate(kCFAllocatorDefault, kCFErrorDomainOSStatus, status, NULL);
+    return NULL;
 }
-
-// Kept from an earlier port: a file-protection class that has no effect on
-// 10.9 (there is no data protection), but whose symbol binaries still bind.
-NSString * const NSFileProtectionComplete = @"NSFileProtectionComplete";

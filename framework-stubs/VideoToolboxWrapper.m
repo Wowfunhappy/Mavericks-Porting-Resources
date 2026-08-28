@@ -1,4 +1,4 @@
-// Wrapper for Foundation on OS X 10.9: supplies the symbols this OS's copy
+// Wrapper for VideoToolbox on OS X 10.9: supplies the symbols this OS's copy
 // lacks, and re-exports the real one so everything else still resolves.
 // Hand-written: the class list started from the symbols real binaries bind,
 // but the constants and functions carry real values and implementations,
@@ -31,24 +31,22 @@
     @implementation name \
     EH_STUB_FORWARDING \
     @end
-STUB_CLASS(NSDateComponentsFormatter)
-STUB_CLASS(NSPresentationIntent)
-STUB_CLASS(NSURLQueryItem)
-
-// Data constants. Where the real value is documented it is reproduced
-// exactly, because callers compare and serialise these.
-NSString * const NSPresentationIntentAttributeName = @"NSPresentationIntent";
 
 // ---- hand-written ----
 
-// NSEdgeInsets exists on 10.9; these two helpers do not.
-const NSEdgeInsets NSEdgeInsetsZero = {0.0, 0.0, 0.0, 0.0};
+#import <VideoToolbox/VideoToolbox.h>
 
-BOOL NSEdgeInsetsEqual(NSEdgeInsets a, NSEdgeInsets b) {
-    return a.top == b.top && a.left == b.left &&
-           a.bottom == b.bottom && a.right == b.right;
+// Property keys. A key's identity is all that matters: 10.9's encoder does not
+// recognise any of these and returns an error for them, which is correct --
+// they all name encoder features 10.9 lacks.
+const CFStringRef kVTCompressionPropertyKey_BaseLayerFrameRateFraction = CFSTR("BaseLayerFrameRateFraction");
+const CFStringRef kVTCompressionPropertyKey_MaxAllowedFrameQP = CFSTR("MaxAllowedFrameQP");
+const CFStringRef kVTEncodeFrameOptionKey_BaseFrameQP = CFSTR("BaseFrameQP");
+const CFStringRef kVTVideoEncoderSpecification_EnableLowLatencyRateControl = CFSTR("EnableLowLatencyRateControl");
+
+// Registers a decoder shipped alongside the app. 10.9 has no such mechanism;
+// reporting failure lets the caller fall back to the built-in decoders.
+OSStatus VTRegisterSupplementalVideoDecoderIfAvailable(CMVideoCodecType codecType) {
+    (void)codecType;
+    return -12906;  /* kVTCouldNotFindVideoDecoderErr */
 }
-
-// Kept from an earlier port: a file-protection class that has no effect on
-// 10.9 (there is no data protection), but whose symbol binaries still bind.
-NSString * const NSFileProtectionComplete = @"NSFileProtectionComplete";

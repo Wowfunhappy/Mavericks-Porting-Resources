@@ -1,4 +1,4 @@
-// Wrapper for Foundation on OS X 10.9: supplies the symbols this OS's copy
+// Wrapper for libxar on OS X 10.9: supplies the symbols this OS's copy
 // lacks, and re-exports the real one so everything else still resolves.
 // Hand-written: the class list started from the symbols real binaries bind,
 // but the constants and functions carry real values and implementations,
@@ -31,24 +31,33 @@
     @implementation name \
     EH_STUB_FORWARDING \
     @end
-STUB_CLASS(NSDateComponentsFormatter)
-STUB_CLASS(NSPresentationIntent)
-STUB_CLASS(NSURLQueryItem)
-
-// Data constants. Where the real value is documented it is reproduced
-// exactly, because callers compare and serialise these.
-NSString * const NSPresentationIntentAttributeName = @"NSPresentationIntent";
 
 // ---- hand-written ----
 
-// NSEdgeInsets exists on 10.9; these two helpers do not.
-const NSEdgeInsets NSEdgeInsetsZero = {0.0, 0.0, 0.0, 0.0};
+#include <stdlib.h>
+#include <string.h>
 
-BOOL NSEdgeInsetsEqual(NSEdgeInsets a, NSEdgeInsets b) {
-    return a.top == b.top && a.left == b.left &&
-           a.bottom == b.bottom && a.right == b.right;
+// xar_get_safe_path was added when xar was hardened against path traversal:
+// it returns the entry's path with any leading "/" and any ".." component
+// removed, so an archive cannot write outside its destination. 10.9's libxar
+// has only xar_get_path, so the sanitising is done here -- that security
+// property is the entire reason the newer call exists and must not be lost by
+// forwarding straight to the old one.
+extern char *xar_get_path(void *f);
+
+char *xar_get_safe_path(void *f) {
+    char *raw = xar_get_path(f);
+    if (!raw) return NULL;
+
+    char *out = calloc(1, strlen(raw) + 1);
+    if (!out) { free(raw); return NULL; }
+
+    char *save = NULL;
+    for (char *tok = strtok_r(raw, "/", &save); tok; tok = strtok_r(NULL, "/", &save)) {
+        if (strcmp(tok, "..") == 0 || strcmp(tok, ".") == 0) continue;
+        if (out[0]) strcat(out, "/");
+        strcat(out, tok);
+    }
+    free(raw);
+    return out;
 }
-
-// Kept from an earlier port: a file-protection class that has no effect on
-// 10.9 (there is no data protection), but whose symbol binaries still bind.
-NSString * const NSFileProtectionComplete = @"NSFileProtectionComplete";
