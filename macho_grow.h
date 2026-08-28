@@ -53,6 +53,14 @@
 #ifndef LC_LINKER_OPTIMIZATION_HINT
 #define LC_LINKER_OPTIMIZATION_HINT 0x2E
 #endif
+/* dyld4-era section type: 4-byte initializer offsets FROM THE IMAGE BASE,
+ * replacing the absolute pointers of S_MOD_INIT_FUNC_POINTERS. */
+#ifndef S_INIT_FUNC_OFFSETS
+#define S_INIT_FUNC_OFFSETS 0x16
+#endif
+#define MG_EXPORT_KIND_MASK        0x03
+#define MG_EXPORT_REEXPORT         0x08
+#define MG_EXPORT_STUB_AND_RESOLVER 0x10
 
 #define MG_PAGE 0x1000UL
 
@@ -149,6 +157,93 @@ static int mg_funcstarts_decode(const uint8_t *blob, uint32_t size,
         addr += d; out[n++] = addr;
     }
     return n;
+}
+
+
+/* ---- base-relative structures ---------------------------------------------
+ *
+ * Lowering the image base keeps every ABSOLUTE vm address fixed, which is what
+ * makes this trick cheap. Values stored as an OFFSET FROM THE IMAGE BASE are the
+ * exception: the base moved out from under them, so each must gain `grow`.
+ * LC_FUNCTION_STARTS' leading delta (handled above) is one. These are the rest.
+ *
+ * Note S_MOD_INIT_FUNC_POINTERS needs nothing: those are absolute pointers that
+ * dyld rebases, and their target addresses do not change. */
+
+/* Add `grow` to every entry of every S_INIT_FUNC_OFFSETS section, or with
+ * patch=0 just verify the pass would be sound. Without this, dyld4-era static
+ * constructors are called at (base - grow) + offset and jump into whatever
+ * precedes them. Returns 0 ok, -1 malformed/unsafe. */
+static int mg_init_offsets_pass(uint8_t *buf, size_t fsize, uint32_t grow, int patch) {
+    struct mach_header_64 *hdr = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof(*hdr);
+    for (uint32_t i = 0; i < hdr->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lcp;
+            struct section_64 *sect = (struct section_64 *)(lcp + sizeof(*seg));
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                if ((sect[j].flags & SECTION_TYPE) != S_INIT_FUNC_OFFSETS) continue;
+                if (sect[j].size % 4) return -1;
+                if ((uint64_t)sect[j].offset + sect[j].size > (uint64_t)fsize) return -1;
+                uint32_t n = (uint32_t)(sect[j].size / 4);
+                uint32_t *e = (uint32_t *)(buf + sect[j].offset);
+                for (uint32_t k = 0; k < n; k++) {
+                    if (!patch) { if (e[k] > UINT32_MAX - grow) return -1; }
+                    else e[k] += grow;
+                }
+            }
+        }
+        lcp += lc->cmdsize;
+    }
+    return 0;
+}
+
+/* Walk the export trie looking for an exported address we would have to
+ * re-encode. Addresses there are ULEB offsets from the image base; bumping one
+ * can widen its encoding and force __LINKEDIT to be rebuilt, which this header
+ * does not do. __mh_execute_header is exported at offset 0 and stays correct --
+ * it names the header, which moved down with the base -- so a trie whose
+ * addresses are all zero is safe to leave alone.
+ * Returns 0 safe, 1 needs re-encoding, -1 malformed. */
+static int mg_trie_scan(const uint8_t *trie, uint32_t size, uint32_t off, int depth) {
+    if (depth > 128 || off >= size) return -1;
+    const uint8_t *p = trie + off, *end = trie + size;
+    uint64_t term; int n = mg_uleb_decode(p, end, &term);
+    if (n == 0) return -1;
+    p += n;
+    if (term) {
+        const uint8_t *tend = p + term;
+        if (tend > end) return -1;
+        uint64_t flags; n = mg_uleb_decode(p, end, &flags);
+        if (n == 0) return -1;
+        p += n;
+        if (!(flags & MG_EXPORT_REEXPORT)) {       /* re-exports carry no address */
+            uint64_t a; n = mg_uleb_decode(p, end, &a);
+            if (n == 0) return -1;
+            if (a != 0) return 1;
+            if (flags & MG_EXPORT_STUB_AND_RESOLVER) {
+                p += n;
+                n = mg_uleb_decode(p, end, &a);
+                if (n == 0) return -1;
+                if (a != 0) return 1;
+            }
+        }
+        p = tend;
+    }
+    if (p >= end) return -1;
+    uint8_t nch = *p++;
+    for (uint8_t i = 0; i < nch; i++) {
+        while (p < end && *p) p++;
+        if (p >= end) return -1;
+        p++;
+        uint64_t coff; n = mg_uleb_decode(p, end, &coff);
+        if (n == 0) return -1;
+        p += n;
+        int r = mg_trie_scan(trie, size, (uint32_t)coff, depth + 1);
+        if (r != 0) return r;
+    }
+    return 0;
 }
 
 /*
@@ -264,6 +359,41 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         }
     }
 
+    /* Audit the other base-relative structures before touching the buffer, so a
+     * refusal leaves it pristine. Silently shipping a binary whose constructors
+     * or exports are `grow` bytes low is far worse than failing here. */
+    if (mg_init_offsets_pass(buf, fsize, grow, 0) != 0) {
+        fprintf(stderr, "macho_grow: malformed S_INIT_FUNC_OFFSETS section; refusing to grow\n");
+        return -1;
+    }
+    {
+        uint32_t tr_off = 0, tr_size = 0;
+        const uint8_t *sp = buf + sizeof(*hdr);
+        for (uint32_t i = 0; i < hdr->ncmds; i++) {
+            const struct load_command *lc = (const struct load_command *)sp;
+            if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) {
+                const struct dyld_info_command *d = (const struct dyld_info_command *)sp;
+                tr_off = d->export_off; tr_size = d->export_size; break;
+            }
+            if (lc->cmd == LC_DYLD_EXPORTS_TRIE) {
+                const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
+                tr_off = d->dataoff; tr_size = d->datasize; break;
+            }
+            sp += lc->cmdsize;
+        }
+        if (tr_off && tr_size) {
+            int r = mg_trie_scan(buf + tr_off, tr_size, 0, 0);
+            if (r != 0) {
+                fprintf(stderr, "macho_grow: export trie %s; its addresses are offsets from "
+                                "the image base and would need a ULEB re-encode that can "
+                                "resize __LINKEDIT, which is not implemented. Reclaim header "
+                                "bytes instead (change_dylib -strip-lc uuid -strip-lc codesig).\n",
+                        r > 0 ? "exports a nonzero address" : "is malformed");
+                return -1;
+            }
+        }
+    }
+
     /* Insert `grow` zero bytes after the load commands, shifting file data down. */
     uint8_t *nbuf = (uint8_t *)realloc(buf, fsize + grow);
     if (!nbuf) { fprintf(stderr, "macho_grow: realloc failed\n"); return -1; }
@@ -352,6 +482,16 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
             break;  /* LC_LOAD_DYLIB/DYLINKER/UUID/VERSION_MIN carry no file offsets */
         }
         lcp += lc->cmdsize;
+    }
+
+    /* Re-point the dyld4 initializer offsets: the base dropped by `grow`, the
+     * constructors did not move, so each offset must gain `grow`. Section file
+     * offsets were bumped in the walk above, so these read from the new home.
+     * The pre-mutation audit proved this cannot overflow. */
+    if (mg_init_offsets_pass(buf, fsize + grow, grow, 1) != 0) {
+        fprintf(stderr, "macho_grow: internal error patching S_INIT_FUNC_OFFSETS after "
+                        "passing the pre-check\n");
+        return -1;
     }
 
     /* Re-encode the base-relative LC_FUNCTION_STARTS leading delta: the base

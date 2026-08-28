@@ -1,0 +1,1 @@
+Code kept in Mavericks Porting Resources is intended to be used across multiple projects. As such, assume any code you write will be reused elsewhere. This should affect the directory structure you choose as well as your code comments and other documentation.

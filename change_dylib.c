@@ -7,7 +7,13 @@
  * first (see macho_grow.h) — that resize only works on a PIE executable and is
  * rejected otherwise.
  *
- * Usage: change_dylib input [-grow] [-change old new] [-delete path] [-reexport path] [-add path]...
+ * Usage: change_dylib input [-grow] [-change old new] [-delete path]
+ *                     [-reexport path] [-add path] [-strip-lc name]...
+ *
+ * -strip-lc drops a whole load command by kind (uuid, codesig, source-version,
+ * build-version, code-sign-drs). It reclaims header padding without moving any
+ * file data, so unlike -grow it never disturbs image-base-relative structures.
+ * Prefer it when a longer path needs a few more bytes.
  *
  * -add appends a brand-new LC_LOAD_DYLIB naming `path` (combine with -grow to
  * guarantee header room). Used to bake a dependency — e.g. libavxemu.dylib —
@@ -25,6 +31,26 @@
 
 #include "macho_grow.h"
 
+/* Load commands safe to drop: purely informational, or invalidated the moment
+ * the binary is rewritten. Deliberately excludes LC_FUNCTION_STARTS (avxemu
+ * reads it for patch-safety bounds) and LC_DATA_IN_CODE. */
+#ifndef LC_SOURCE_VERSION
+#define LC_SOURCE_VERSION 0x2A
+#endif
+#ifndef LC_BUILD_VERSION
+#define LC_BUILD_VERSION 0x32
+#endif
+#ifndef LC_DYLIB_CODE_SIGN_DRS
+#define LC_DYLIB_CODE_SIGN_DRS 0x2B
+#endif
+static const struct { const char *name; uint32_t cmd; } strippable[] = {
+    { "uuid",           LC_UUID                },
+    { "codesig",        LC_CODE_SIGNATURE      },
+    { "source-version", LC_SOURCE_VERSION      },
+    { "build-version",  LC_BUILD_VERSION       },
+    { "code-sign-drs",  LC_DYLIB_CODE_SIGN_DRS },
+};
+
 struct change {
     const char *old_path;
     const char *new_path;   /* NULL = delete; "" = in-place, no path change */
@@ -40,6 +66,7 @@ struct change {
  */
 static void build_lcs(const uint8_t *buf, const struct change *changes, int nchanges,
                       const char *const *adds, int nadds,
+                      const uint32_t *strip, int nstrip,
                       uint8_t *new_lcs, uint32_t *out_off, uint32_t *out_ncmds,
                       int *out_mods, int verbose) {
     const struct mach_header_64 *hdr = (const struct mach_header_64 *)buf;
@@ -52,6 +79,20 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
         uint32_t cmdsize = lc->cmdsize;
         uint32_t write_size = cmdsize;
         int matched = -1;
+
+        /* Dropping a command reclaims its bytes for the rest of the table.
+         * Any __LINKEDIT payload it referenced simply stops being reachable;
+         * nothing moves, so no offset anywhere needs fixing up. */
+        int stripped = 0;
+        for (int s = 0; s < nstrip; s++)
+            if (lc->cmd == strip[s]) { stripped = 1; break; }
+        if (stripped) {
+            if (verbose) printf("  Strip [%u bytes]: load command 0x%x\n", cmdsize, lc->cmd);
+            ncmds--;
+            mods++;
+            lcp += cmdsize;
+            continue;
+        }
 
         if (lc->cmd == LC_LOAD_DYLIB || lc->cmd == LC_LOAD_WEAK_DYLIB ||
             lc->cmd == LC_ID_DYLIB || lc->cmd == LC_REEXPORT_DYLIB) {
@@ -126,7 +167,12 @@ static void build_lcs(const uint8_t *buf, const struct change *changes, int ncha
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: %s input [-grow] [-change old new] [-delete path] [-reexport path] [-add path] ...\n", argv[0]);
+        fprintf(stderr, "Usage: %s input [-grow] [-change old new] [-delete path] "
+                        "[-reexport path] [-add path] [-strip-lc name] ...\n", argv[0]);
+        fprintf(stderr, "  -strip-lc kinds:");
+        for (size_t k = 0; k < sizeof(strippable)/sizeof(strippable[0]); k++)
+            fprintf(stderr, " %s", strippable[k].name);
+        fprintf(stderr, "\n");
         return 1;
     }
     const char *path = argv[1];
@@ -136,10 +182,20 @@ int main(int argc, char **argv) {
     const char *adds[32];
     int nadds = 0;
     int allow_grow = 0;
+    uint32_t strip[16];
+    int nstrip = 0;
     for (int i = 2; i < argc; ) {
         if (strcmp(argv[i], "-grow") == 0) {
             allow_grow = 1;
             i += 1;
+        } else if (strcmp(argv[i], "-strip-lc") == 0 && i + 1 < argc) {
+            size_t k, nk = sizeof(strippable)/sizeof(strippable[0]);
+            for (k = 0; k < nk; k++)
+                if (strcmp(argv[i+1], strippable[k].name) == 0) break;
+            if (k == nk) { fprintf(stderr, "unknown -strip-lc kind: %s\n", argv[i+1]); return 1; }
+            if (nstrip == 16) { fprintf(stderr, "too many -strip-lc\n"); return 1; }
+            strip[nstrip++] = strippable[k].cmd;
+            i += 2;
         } else if (strcmp(argv[i], "-add") == 0 && i + 1 < argc) {
             adds[nadds++] = argv[i+1];
             i += 2;
@@ -189,9 +245,9 @@ int main(int argc, char **argv) {
     /* Build the new table once to learn its size (and print diagnostics). */
     uint8_t *new_lcs = calloc(1, first_sect_off + add_bytes + 64);
     uint32_t new_off, new_ncmds; int modifications;
-    build_lcs(buf, changes, nchanges, adds, nadds, new_lcs, &new_off, &new_ncmds, &modifications, 1);
+    build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, new_lcs, &new_off, &new_ncmds, &modifications, 1);
 
-    if (modifications == 0) { printf("No matching dylibs found.\n"); return 0; }
+    if (modifications == 0) { printf("Nothing to change.\n"); return 0; }
 
     /* The new table must fit before the first section's data. The boundary is
      * sizeof(mach_header_64) + sizeofcmds; using new_off alone would understate
@@ -220,7 +276,7 @@ int main(int argc, char **argv) {
          * the copied load commands reflect the shift. */
         free(new_lcs);
         new_lcs = calloc(1, first_sect_off + add_bytes + 64);
-        build_lcs(buf, changes, nchanges, adds, nadds, new_lcs, &new_off, &new_ncmds, &modifications, 0);
+        build_lcs(buf, changes, nchanges, adds, nadds, strip, nstrip, new_lcs, &new_off, &new_ncmds, &modifications, 0);
     }
 
     /* Commit: zero the whole LC area, write the new table, fix up the header. */
