@@ -654,6 +654,7 @@
       "_dispatch_barrier_async_and_wait_f", 
       "_dispatch_block_cancel", 
       "_dispatch_block_create", 
+      "_dispatch_block_create_with_qos_class", 
       "_dispatch_block_testcancel", 
       "_dispatch_queue_attr_make_with_qos_class", 
       "_dispatch_queue_create_with_target$V2", 
@@ -759,6 +760,7 @@
     "link_libs": [
       "c++abi"
     ], 
+    "restrict_exports": true, 
     "source": "cxxWrapper.cpp", 
     "symbols": [
       "__ZNKSt3__14__fs10filesystem18directory_iterator13__dereferenceEv", 
@@ -810,13 +812,22 @@
     ], 
     "source": "objcShim.m", 
     "symbols": [
+      "__objc_realizeClassFromSwift", 
       "_objc_alloc_init", 
+      "_objc_copyWeak", 
+      "_objc_destroyWeak", 
+      "_objc_initWeak", 
       "_objc_loadClassref", 
+      "_objc_loadWeak", 
+      "_objc_loadWeakRetained", 
+      "_objc_moveWeak", 
       "_objc_opt_class", 
       "_objc_opt_isKindOfClass", 
       "_objc_opt_new", 
       "_objc_opt_respondsToSelector", 
       "_objc_opt_self", 
+      "_objc_readClassPair", 
+      "_objc_storeWeak", 
       "_objc_unsafeClaimAutoreleasedReturnValue"
     ]
   }, 

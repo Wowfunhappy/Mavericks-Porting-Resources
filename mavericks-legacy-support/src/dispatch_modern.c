@@ -67,6 +67,19 @@ long dispatch_block_testcancel(dispatch_block_t block) {
     return flag && *flag ? 1 : 0;
 }
 
+/* The QoS-taking form of dispatch_block_create (10.10). 10.9 has no
+ * quality-of-service classes, so the class and relative priority are dropped;
+ * what the caller actually depends on -- a block it can cancel -- is
+ * unaffected, and scheduling falls back to the single priority this OS has. */
+dispatch_block_t dispatch_block_create_with_qos_class(unsigned long flags,
+                                                      int qos_class,
+                                                      int relative_priority,
+                                                      dispatch_block_t block) {
+    (void)qos_class;
+    (void)relative_priority;
+    return dispatch_block_create(flags, block);
+}
+
 /* This library's own <dispatch/dispatch.h> defines dispatch_activate as a
  * macro for dispatch_resume, which is what a consumer compiled against it
  * gets. A prebuilt binary binds the symbol instead, so the function has to

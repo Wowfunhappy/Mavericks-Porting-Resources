@@ -106,6 +106,20 @@ print(a[0] if a and a[0].startswith('/') else (os.path.join('$HERE','..',a[0]) i
 import json
 e=json.load(open('$HERE/frameworks.json'))['$name']
 print(' '.join('-Wl,-alias,%s,%s'%(a,b) for a,b in e.get('alias_symbols',[])))")
+        # Some wrappers link an archive that drags in far more than they need.
+        # "restrict_exports" limits what the wrapper advertises to its declared
+        # symbols, so incidental definitions stay private instead of shadowing
+        # the real library for every consumer.
+        expflag=""
+        if [ "$(python -c "
+import json;print(json.load(open('$HERE/frameworks.json'))['$name'].get('restrict_exports',False))")" = "True" ]; then
+            explist="$OUT/.exports_$name.txt"
+            python -c "
+import json
+e=json.load(open('$HERE/frameworks.json'))['$name']
+open('$explist','w').write('\n'.join(e['symbols'])+'\n')"
+            expflag="-Wl,-exported_symbols_list,$explist"
+        fi
         uflags=""
         if [ -n "$archive" ]; then
             case "$archive" in /*) ;; *) archive="$HERE/../$archive" ;; esac
@@ -127,8 +141,8 @@ print(' '.join('-Wl,-u,'+s for s in sorted(set(e['symbols']) & have)))")
             ${src:+"$HERE/$src"} \
             -install_name "@rpath/$lib" \
             $(vflags_for $name) \
+            $uflags $aflags $expflag ${archive:+"$archive"} ${extra1:+"$extra1"} \
             -Wl,-reexport_library,"$real" \
-            $uflags $aflags ${archive:+"$archive"} ${extra1:+"$extra1"} \
             $(python -c "
 import json;e=json.load(open('$HERE/frameworks.json'))['$name']
 fw=e.get('link_frameworks')

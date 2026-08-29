@@ -39,7 +39,15 @@ HEADER = """// Stub %(fw)s for OS X 10.9.
     - (NSMethodSignature *)methodSignatureForSelector:(SEL)sel { \\
         NSMethodSignature *known = [super methodSignatureForSelector:sel]; \\
         return known ?: [NSMethodSignature signatureWithObjCTypes:"@@:@@@@@@@@"]; } \\
-    - (void)forwardInvocation:(NSInvocation *)invocation { }
+    - (void)forwardInvocation:(NSInvocation *)invocation { } \
+    /* A stub must tolerate key-value coding as well as selectors. Callers \
+     * configure these classes with setValue:forKey:, and KVC does not go \
+     * through forwardInvocation: -- it raises instead, which is fatal: \
+     *   this class is not key value coding-compliant for the key clear */ \
+    - (void)setValue:(id)value forUndefinedKey:(NSString *)key { (void)value; (void)key; } \
+    - (id)valueForUndefinedKey:(NSString *)key { (void)key; return nil; } \
+    + (void)setValue:(id)value forUndefinedKey:(NSString *)key { (void)value; (void)key; } \
+    + (id)valueForUndefinedKey:(NSString *)key { (void)key; return nil; }
 
 #define STUB_CLASS(name) \\
     @interface name : NSObject @end \\
