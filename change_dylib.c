@@ -87,6 +87,19 @@ static const struct { const char *name; uint32_t cmd; } strippable[] = {
 
 #define CD_MAX_DYLIBS 253   /* MAX_LIBRARY_ORDINAL */
 
+/* Caps on how many times one option may repeat. Each option accumulates into a
+ * fixed-size array; nothing reads a length back, so an unchecked write past the
+ * end corrupts whatever follows instead of failing. Check every one. */
+#define CD_MAX_OPS   32
+#define CD_MAX_STRIP 16
+#define CD_ROOM(n, max, flag)                                            \
+    do {                                                                 \
+        if ((n) == (max)) {                                              \
+            fprintf(stderr, "too many %s (max %d)\n", (flag), (max));    \
+            return 1;                                                    \
+        }                                                                \
+    } while (0)
+
 /* Load commands that consume a library ordinal, in load order. LC_ID_DYLIB is
  * deliberately absent: it names the image itself and is not addressable, and so
  * is LC_RPATH, which is a search path rather than a dependency. */
@@ -489,18 +502,18 @@ int main(int argc, char **argv) {
     }
     const char *path = argv[1];
 
-    struct change changes[32];
+    struct change changes[CD_MAX_OPS];
     int nchanges = 0;
-    const char *adds[32];
+    const char *adds[CD_MAX_OPS];
     int nadds = 0;
-    const char *inserts[32];
+    const char *inserts[CD_MAX_OPS];
     int ninserts = 0;
-    struct change rchanges[32];
+    struct change rchanges[CD_MAX_OPS];
     int nrchanges = 0;
-    const char *radds[32];
+    const char *radds[CD_MAX_OPS];
     int nradds = 0;
     int allow_grow = 0;
-    uint32_t strip[16];
+    uint32_t strip[CD_MAX_STRIP];
     int nstrip = 0;
     for (int i = 2; i < argc; ) {
         if (strcmp(argv[i], "-grow") == 0) {
@@ -511,43 +524,51 @@ int main(int argc, char **argv) {
             for (k = 0; k < nk; k++)
                 if (strcmp(argv[i+1], strippable[k].name) == 0) break;
             if (k == nk) { fprintf(stderr, "unknown -strip-lc kind: %s\n", argv[i+1]); return 1; }
-            if (nstrip == 16) { fprintf(stderr, "too many -strip-lc\n"); return 1; }
+            CD_ROOM(nstrip, CD_MAX_STRIP, "-strip-lc");
             strip[nstrip++] = strippable[k].cmd;
             i += 2;
         } else if (strcmp(argv[i], "-add") == 0 && i + 1 < argc) {
+            CD_ROOM(nadds, CD_MAX_OPS, "-add");
             adds[nadds++] = argv[i+1];
             i += 2;
         } else if (strcmp(argv[i], "-insert") == 0 && i + 1 < argc) {
+            CD_ROOM(ninserts, CD_MAX_OPS, "-insert");
             inserts[ninserts++] = argv[i+1];
             i += 2;
         } else if (strcmp(argv[i], "-change") == 0 && i + 2 < argc) {
+            CD_ROOM(nchanges, CD_MAX_OPS, "-change");
             changes[nchanges].old_path = argv[i+1];
             changes[nchanges].new_path = argv[i+2];
             changes[nchanges].reexport = 0;
             nchanges++;
             i += 3;
         } else if (strcmp(argv[i], "-delete") == 0 && i + 1 < argc) {
+            CD_ROOM(nchanges, CD_MAX_OPS, "-delete");
             changes[nchanges].old_path = argv[i+1];
             changes[nchanges].new_path = NULL;
             changes[nchanges].reexport = 0;
             nchanges++;
             i += 2;
         } else if (strcmp(argv[i], "-reexport") == 0 && i + 1 < argc) {
+            CD_ROOM(nchanges, CD_MAX_OPS, "-reexport");
             changes[nchanges].old_path = argv[i+1];
             changes[nchanges].new_path = "";
             changes[nchanges].reexport = 1;
             nchanges++;
             i += 2;
         } else if (strcmp(argv[i], "-add-rpath") == 0 && i + 1 < argc) {
+            CD_ROOM(nradds, CD_MAX_OPS, "-add-rpath");
             radds[nradds++] = argv[i+1];
             i += 2;
         } else if (strcmp(argv[i], "-change-rpath") == 0 && i + 2 < argc) {
+            CD_ROOM(nrchanges, CD_MAX_OPS, "-change-rpath");
             rchanges[nrchanges].old_path = argv[i+1];
             rchanges[nrchanges].new_path = argv[i+2];
             rchanges[nrchanges].reexport = 0;
             nrchanges++;
             i += 3;
         } else if (strcmp(argv[i], "-delete-rpath") == 0 && i + 1 < argc) {
+            CD_ROOM(nrchanges, CD_MAX_OPS, "-delete-rpath");
             rchanges[nrchanges].old_path = argv[i+1];
             rchanges[nrchanges].new_path = NULL;
             rchanges[nrchanges].reexport = 0;
