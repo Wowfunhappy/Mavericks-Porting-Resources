@@ -17,6 +17,7 @@
 #include "macho_grow.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 static int fails = 0;
 #define CHECK(cond, msg, ...) do { if (!(cond)) { \
@@ -136,11 +137,11 @@ static void test_invariant_addresses_preserved(void) {
 }
 
 /* ---- __TEXT,__init_offsets re-base ----
- * Same bug class as the function-starts delta: entries are offsets from the
- * mach header, so lowering the base leaves them all `grow` too small. Driven
- * against a synthetic image because the 10.9 toolchain can't emit an
- * __init_offsets section to build a fixture from; the end-to-end proof is a
- * grown Claude Code binary reaching its entry point (see the commit message). */
+ * Entries are offsets from the mach header, so lowering the base leaves them
+ * all `grow` too small. Sections are matched by TYPE (S_INIT_FUNC_OFFSETS)
+ * rather than by name: the name is a linker convention, the type is what the
+ * format guarantees. Driven against a synthetic image because the 10.9
+ * toolchain cannot emit an __init_offsets section to build a fixture from. */
 static void test_init_offsets_rebase(void) {
     static uint8_t img[8192];
     memset(img, 0, sizeof img);
@@ -158,23 +159,119 @@ static void test_init_offsets_rebase(void) {
     strncpy(s->segname, "__TEXT", sizeof s->segname);
     s->offset = 4096;
     s->size = 3 * sizeof(uint32_t);
+    s->flags = S_INIT_FUNC_OFFSETS;
     uint32_t *e = (uint32_t *)(img + 4096);
     e[0] = 0x1000; e[1] = 0x2000; e[2] = 0x3000;
 
-    CHECK(mg_rebase_init_offsets(img, 0x1000) == 0, "init_offsets rebase returns 0");
+    CHECK(mg_init_offsets_pass(img, sizeof img, 0x1000, 1) == 0, "init_offsets patch returns 0");
     CHECK(e[0] == 0x2000 && e[1] == 0x3000 && e[2] == 0x4000,
           "every entry gained grow (got %u %u %u)", e[0], e[1], e[2]);
 
-    /* A section that isn't __init_offsets must be left alone. */
-    strncpy(s->sectname, "__text", sizeof s->sectname);
+    /* A section of another type must be left alone, even named __init_offsets. */
+    s->flags = S_REGULAR;
     e[0] = 0x1000;
-    CHECK(mg_rebase_init_offsets(img, 0x1000) == 0 && e[0] == 0x1000,
-          "other sections untouched (got %u)", e[0]);
+    CHECK(mg_init_offsets_pass(img, sizeof img, 0x1000, 1) == 0 && e[0] == 0x1000,
+          "sections of other types untouched (got %u)", e[0]);
 
-    /* An entry that would wrap is refused rather than silently truncated. */
-    strncpy(s->sectname, "__init_offsets", sizeof s->sectname);
+    /* An entry that would wrap is refused by the audit, before anything moves. */
+    s->flags = S_INIT_FUNC_OFFSETS;
     e[0] = 0xffffffffu;
-    CHECK(mg_rebase_init_offsets(img, 0x1000) == -1, "overflowing entry refused");
+    CHECK(mg_init_offsets_pass(img, sizeof img, 0x1000, 0) == -1, "overflowing entry refused");
+}
+
+/* ---- the whole grow, end to end ----
+ * Every other case here calls one helper directly. That is how a duplicated
+ * re-base survived review: two functions each added `grow` to the same
+ * __init_offsets entries, mg_grow_header called both, and no test ran the path
+ * that used them. This builds the smallest image mg_grow_header will accept and
+ * checks the entries afterwards, so any second application shows up as 2*grow.
+ *
+ * Deliberately carries no LC_FUNCTION_STARTS and no export trie: both are
+ * audited separately, and leaving them out keeps this about the one structure.
+ */
+static uint8_t *build_growable_image(size_t *fsize_out, uint32_t *sect_off_out) {
+    const size_t fsize = 8192;
+    uint8_t *buf = (uint8_t *)calloc(1, fsize);
+
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    h->magic = MH_MAGIC_64;
+    h->filetype = MH_EXECUTE;
+    h->flags = MH_PIE;
+    h->ncmds = 2;
+
+    struct segment_command_64 *pz = (struct segment_command_64 *)(buf + sizeof *h);
+    pz->cmd = LC_SEGMENT_64;
+    pz->cmdsize = sizeof *pz;
+    strcpy(pz->segname, "__PAGEZERO");
+    pz->vmaddr = 0;
+    pz->vmsize = 0x100000000ull;   /* room to lower the base into */
+    pz->fileoff = 0;
+    pz->filesize = 0;              /* filesize 0 keeps it out of the __TEXT probe */
+
+    struct segment_command_64 *tx = (struct segment_command_64 *)((uint8_t *)pz + pz->cmdsize);
+    tx->cmd = LC_SEGMENT_64;
+    tx->cmdsize = sizeof *tx + sizeof(struct section_64);
+    strcpy(tx->segname, "__TEXT");
+    tx->vmaddr = 0x100000000ull;
+    tx->vmsize = fsize;
+    tx->fileoff = 0;
+    tx->filesize = fsize;
+    tx->nsects = 1;
+
+    struct section_64 *sc = (struct section_64 *)((uint8_t *)tx + sizeof *tx);
+    strncpy(sc->sectname, "__init_offsets", sizeof sc->sectname);
+    strncpy(sc->segname, "__TEXT", sizeof sc->segname);
+    sc->addr = 0x100001000ull;
+    sc->size = 2 * sizeof(uint32_t);
+    sc->offset = 4096;
+    sc->flags = S_INIT_FUNC_OFFSETS;   /* a real one carries both name and type */
+
+    h->sizeofcmds = (uint32_t)(pz->cmdsize + tx->cmdsize);
+
+    uint32_t *e = (uint32_t *)(buf + sc->offset);
+    e[0] = 0x1000; e[1] = 0x2000;
+
+    *fsize_out = fsize;
+    *sect_off_out = sc->offset;
+    return buf;
+}
+
+/* After a grow, find __init_offsets again -- its file offset moved with the data. */
+static uint32_t *find_init_offsets(uint8_t *buf) {
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lcp;
+            struct section_64 *sect = (struct section_64 *)(lcp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++)
+                if ((sect[j].flags & SECTION_TYPE) == S_INIT_FUNC_OFFSETS)
+                    return (uint32_t *)(buf + sect[j].offset);
+        }
+        lcp += lc->cmdsize;
+    }
+    return NULL;
+}
+
+static void test_grow_applies_init_offsets_once(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_growable_image(&fsize, &sect_off);
+    const uint32_t grow = 0x1000;
+
+    int r = mg_grow_header(&buf, &fsize, grow);
+    CHECK(r == 0, "mg_grow_header succeeds on the synthetic image (got %d)", r);
+    if (r != 0) { free(buf); return; }
+
+    uint32_t *e = find_init_offsets(buf);
+    CHECK(e != NULL, "__init_offsets still locatable after the grow");
+    if (e) {
+        CHECK(e[0] == 0x1000 + grow, "entry 0 gained grow exactly once: got %#x want %#x",
+              e[0], 0x1000 + grow);
+        CHECK(e[1] == 0x2000 + grow, "entry 1 gained grow exactly once: got %#x want %#x",
+              e[1], 0x2000 + grow);
+    }
+    free(buf);
 }
 
 int main(void) {
@@ -187,6 +284,7 @@ int main(void) {
     test_reencode_malformed();
     test_invariant_addresses_preserved();
     test_init_offsets_rebase();
+    test_grow_applies_init_offsets_once();
     if (fails) { printf("macho_grow_test: %d FAILURE(S)\n", fails); return 1; }
     printf("macho_grow_test: all cases pass\n");
     return 0;
