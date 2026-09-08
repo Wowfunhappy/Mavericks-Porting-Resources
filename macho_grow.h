@@ -249,11 +249,14 @@ static int mg_trie_scan(const uint8_t *trie, uint32_t size, uint32_t off, int de
 /* Forward: mg_collect (below) needs the compact-unwind walker, which is defined
  * after it so its long explanation sits next to the grow it serves. */
 static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                          uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
+                          uint64_t base, uint64_t *out, uint8_t *kinds,
+                          uint32_t *n, uint32_t max);
 static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
+                        uint64_t base, uint64_t *out, uint8_t *kinds,
+                        uint32_t *n, uint32_t max);
 static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
+                        uint64_t base, uint64_t *out, uint8_t *kinds,
+                        uint32_t *n, uint32_t max);
 
 /* ---- verification: prove the grow moved nothing ---------------------------
  * Every structure below stores an offset FROM THE IMAGE BASE, so lowering the
@@ -265,12 +268,19 @@ static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
  * mg_collect walks the base-relative structures in load-command order, which is
  * deterministic and identical before and after, so element i means the same
  * thing in both snapshots. */
+/* Not every base-relative address names a function. Initializers and
+ * compact-unwind entries do; a data export, a jump-table range, an LSDA blob and
+ * a personality GOT slot do not. Only MG_K_FUNC entries can be checked against
+ * LC_FUNCTION_STARTS. */
+#define MG_K_ANY  0
+#define MG_K_FUNC 1
+
 typedef struct { uint64_t *addr; uint32_t n; } mg_snapshot;
 
 #define MG_SNAP_MAX 65536
 
-static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t max,
-                      uint32_t *n_out) {
+static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint8_t *kinds,
+                      uint32_t max, uint32_t *n_out) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
     const uint8_t *sp = buf + sizeof *h;
     uint64_t base = 0;
@@ -297,6 +307,7 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
                 if (mg_uleb_decode(buf + d->dataoff, buf + d->dataoff + d->datasize, &d0) == 0)
                     return -1;
                 if (n >= max) return -1;
+                if (kinds) kinds[n] = MG_K_FUNC;   /* the first function's address */
                 out[n++] = base + d0;
             }
         }
@@ -310,6 +321,7 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
                 uint64_t cnt = sect[j].size / sizeof(uint32_t);
                 for (uint64_t k = 0; k < cnt; k++) {
                     if (n >= max) return -1;
+                    if (kinds) kinds[n] = MG_K_FUNC;   /* initializers are functions */
                     out[n++] = base + e[k];
                 }
             }
@@ -318,9 +330,9 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
     }
     /* Compact unwind last, so element order is stable across before/after. The
      * cast is safe: with `out` non-NULL the walker only reads. */
-    if (mg_trie_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
-    if (mg_dice_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
-    if (mg_unwind_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
+    if (mg_trie_walk((uint8_t *)buf, fsize, 0, 0, base, out, kinds, &n, max) != 0) return -1;
+    if (mg_dice_walk((uint8_t *)buf, fsize, 0, 0, base, out, kinds, &n, max) != 0) return -1;
+    if (mg_unwind_walk((uint8_t *)buf, fsize, 0, 0, base, out, kinds, &n, max) != 0) return -1;
     *n_out = n;
     return 0;
 }
@@ -328,7 +340,7 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
 static int mg_snapshot_take(const uint8_t *buf, size_t fsize, mg_snapshot *s) {
     s->addr = (uint64_t *)malloc(MG_SNAP_MAX * sizeof(uint64_t));
     if (!s->addr) return -1;
-    if (mg_collect(buf, fsize, s->addr, MG_SNAP_MAX, &s->n) != 0) {
+    if (mg_collect(buf, fsize, s->addr, NULL, MG_SNAP_MAX, &s->n) != 0) {
         free(s->addr); s->addr = NULL; s->n = 0; return -1;
     }
     return 0;
@@ -342,7 +354,7 @@ static int mg_verify(const uint8_t *buf, size_t fsize, const mg_snapshot *before
     uint64_t *now = (uint64_t *)malloc(MG_SNAP_MAX * sizeof(uint64_t));
     if (!now) return -1;
     uint32_t n = 0;
-    if (mg_collect(buf, fsize, now, MG_SNAP_MAX, &n) != 0) {
+    if (mg_collect(buf, fsize, now, NULL, MG_SNAP_MAX, &n) != 0) {
         fprintf(stderr, "macho_grow: verify could not re-read the base-relative structures\n");
         free(now); return -1;
     }
@@ -393,7 +405,8 @@ static int mg_uw_bump(uint8_t *p, uint32_t grow, int patch) {
 }
 
 static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                          uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+                          uint64_t base, uint64_t *out, uint8_t *kinds,
+                          uint32_t *n, uint32_t max) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
     const uint8_t *sp = buf + sizeof *h;
     uint8_t *u = NULL; uint32_t usz = 0;
@@ -414,9 +427,12 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
     if (!u) return 0;                       /* no compact unwind: nothing to do */
 
 #define UW_RD(off) ({ uint32_t _v; memcpy(&_v, u + (off), sizeof _v); _v; })
-#define UW_VISIT(off) do {                                                     \
-        if (out) { if (*n >= max) return -1; out[(*n)++] = base + UW_RD(off); } \
-        else if (mg_uw_bump(u + (off), grow, patch) != 0) return -1;            \
+#define UW_VISIT(off, k) do {                                                  \
+        if (out) {                                                             \
+            if (*n >= max) return -1;                                          \
+            if (kinds) kinds[*n] = (k);                                        \
+            out[(*n)++] = base + UW_RD(off);                                   \
+        } else if (mg_uw_bump(u + (off), grow, patch) != 0) return -1;          \
     } while (0)
 
     if (usz < 28) return -1;
@@ -426,12 +442,12 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
 
     if (peCnt) {
         if ((uint64_t)peOff + 4ull * peCnt > usz) return -1;
-        for (uint32_t k = 0; k < peCnt; k++) UW_VISIT(peOff + 4 * k);
+        for (uint32_t k = 0; k < peCnt; k++) UW_VISIT(peOff + 4 * k, MG_K_ANY); /* GOT slot */
     }
 
     if (idxCnt < 1) return -1;
     if ((uint64_t)idxOff + 12ull * idxCnt > usz) return -1;
-    for (uint32_t k = 0; k < idxCnt; k++) UW_VISIT(idxOff + 12 * k);   /* incl. sentinel */
+    for (uint32_t k = 0; k < idxCnt; k++) UW_VISIT(idxOff + 12 * k, MG_K_FUNC); /* incl. sentinel */
 
     /* The last first-level entry is the sentinel: it has no page, and its lsda
      * offset marks the end of the previous entry's LSDA array. */
@@ -439,7 +455,10 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
         uint32_t lo = UW_RD(idxOff + 12 * k + 8);
         uint32_t hi = UW_RD(idxOff + 12 * (k + 1) + 8);
         if (hi < lo || hi > usz) return -1;
-        for (uint32_t e = lo; e + 8 <= hi; e += 8) { UW_VISIT(e); UW_VISIT(e + 4); }
+        for (uint32_t e = lo; e + 8 <= hi; e += 8) {
+            UW_VISIT(e, MG_K_FUNC);        /* functionOffset */
+            UW_VISIT(e + 4, MG_K_ANY);     /* lsdaOffset -> __gcc_except_tab */
+        }
     }
 
     for (uint32_t k = 0; k + 1 < idxCnt; k++) {
@@ -454,7 +473,7 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
         memcpy(&ec,  u + pg + 6, sizeof ec);
         uint64_t first = (uint64_t)pg + epo;
         if (first + 8ull * ec > usz) return -1;
-        for (uint32_t e = 0; e < ec; e++) UW_VISIT((uint32_t)(first + 8ull * e));
+        for (uint32_t e = 0; e < ec; e++) UW_VISIT((uint32_t)(first + 8ull * e), MG_K_FUNC);
     }
 #undef UW_VISIT
 #undef UW_RD
@@ -468,7 +487,8 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
  * of each entry corrupts every range while still "changing by grow".
  * One walker, three uses, as for compact unwind. */
 static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+                        uint64_t base, uint64_t *out, uint8_t *kinds,
+                        uint32_t *n, uint32_t max) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
     const uint8_t *sp = buf + sizeof *h;
     for (uint32_t i = 0; i < h->ncmds; i++) {
@@ -483,6 +503,7 @@ static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
                 if (out) {
                     if (*n >= max) return -1;
                     uint32_t v; memcpy(&v, e + k, sizeof v);
+                    if (kinds) kinds[*n] = MG_K_ANY;   /* jump tables sit mid-function */
                     out[(*n)++] = base + v;
                 } else if (mg_uw_bump(e + k, grow, patch) != 0) {
                     return -1;
@@ -514,7 +535,8 @@ static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
  * the __init_offsets double-apply. */
 static int mg_trie_node(uint8_t *trie, uint32_t size, uint32_t off, int depth,
                         uint32_t grow, int patch, uint64_t base,
-                        uint64_t *out, uint32_t *n, uint32_t max, uint8_t *seen) {
+                        uint64_t *out, uint8_t *kinds, uint32_t *n, uint32_t max,
+                        uint8_t *seen) {
     if (depth > 128 || off >= size) return -1;
     if (seen[off]) return 0;
     seen[off] = 1;
@@ -536,6 +558,7 @@ static int mg_trie_node(uint8_t *trie, uint32_t size, uint32_t off, int depth,
                 if (a != 0) {
                     if (out) {
                         if (*n >= max) return -1;
+                        if (kinds) kinds[*n] = MG_K_ANY;  /* data exports are not functions */
                         out[(*n)++] = base + a;
                     } else {
                         if (mg_uleb_minlen(a + grow) > w) return 1;   /* would widen */
@@ -557,14 +580,15 @@ static int mg_trie_node(uint8_t *trie, uint32_t size, uint32_t off, int depth,
         if (k == 0) return -1;
         p += k;
         int r = mg_trie_node(trie, size, (uint32_t)coff, depth + 1, grow, patch,
-                             base, out, n, max, seen);
+                             base, out, kinds, n, max, seen);
         if (r != 0) return r;
     }
     return 0;
 }
 
 static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
-                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+                        uint64_t base, uint64_t *out, uint8_t *kinds,
+                        uint32_t *n, uint32_t max) {
     const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
     const uint8_t *sp = buf + sizeof *h;
     uint32_t off = 0, size = 0;
@@ -584,7 +608,7 @@ static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
     if ((uint64_t)off + size > fsize) return -1;
     uint8_t *seen = (uint8_t *)calloc(size, 1);
     if (!seen) return -1;
-    int r = mg_trie_node(buf + off, size, 0, 0, grow, patch, base, out, n, max, seen);
+    int r = mg_trie_node(buf + off, size, 0, 0, grow, patch, base, out, kinds, n, max, seen);
     free(seen);
     return r;
 }
@@ -701,6 +725,75 @@ static int mg_classify(const uint8_t *buf) {
         sp += lc->cmdsize;
     }
     return 0;
+}
+
+/* ---- plausibility: verification with no "before" to compare against --------
+ * mg_verify is stronger, but it needs a snapshot taken before the transform.
+ * The wrapper cannot have one: it checks the end state of a pipeline whose
+ * earlier stages ran in other processes. This works from the finished file.
+ *
+ * The useful check is not "is this address inside __text" -- __text is 63 MB on
+ * Claude Code, so a one-page error stays comfortably inside it. It is that
+ * initializers and compact-unwind entries name FUNCTIONS, so their targets must
+ * appear in LC_FUNCTION_STARTS. Measured on 2.1.263: 13/13 first-level, 198/198
+ * LSDA and 9/9 initializers land exactly on one of 71,974 known starts.
+ *
+ * Without LC_FUNCTION_STARTS there is nothing to check against, so this passes
+ * rather than refusing -- a weaker guarantee, honestly reported by returning 0. */
+static int mg_addr_known(const uint64_t *sorted, int n, uint64_t a) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (sorted[mid] == a) return 1;
+        if (sorted[mid] < a) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
+static int mg_plausible(const uint8_t *buf, size_t fsize) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    uint64_t base = 0; uint32_t fsoff = 0, fssize = 0;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_FUNCTION_STARTS) {
+            const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
+            fsoff = d->dataoff; fssize = d->datasize;
+        }
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
+            if (!base && seg->fileoff == 0 && seg->filesize > 0) base = seg->vmaddr;
+        }
+        sp += lc->cmdsize;
+    }
+    if (!base) return -1;
+    if (!fsoff || !fssize) return 0;                 /* nothing to check against */
+    if ((uint64_t)fsoff + fssize > fsize) return -1;
+
+    uint64_t *starts = (uint64_t *)malloc((size_t)fssize * sizeof(uint64_t));
+    uint64_t *addr   = (uint64_t *)malloc(MG_SNAP_MAX * sizeof(uint64_t));
+    uint8_t  *kinds  = (uint8_t  *)malloc(MG_SNAP_MAX);
+    if (!starts || !addr || !kinds) { free(starts); free(addr); free(kinds); return -1; }
+
+    int ns = mg_funcstarts_decode(buf + fsoff, fssize, base, starts, (int)fssize);
+    uint32_t n = 0;
+    int rc = 0;
+    if (ns <= 0 || mg_collect(buf, fsize, addr, kinds, MG_SNAP_MAX, &n) != 0) {
+        rc = -1;
+    } else {
+        for (uint32_t i = 0; i < n && rc == 0; i++) {
+            if (kinds[i] != MG_K_FUNC) continue;      /* only these name functions */
+            if (mg_addr_known(starts, ns, addr[i])) continue;
+            fprintf(stderr, "macho_grow: implausible -- a base-relative entry names %#llx, "
+                            "which is not one of the %d addresses in LC_FUNCTION_STARTS. "
+                            "Initializers and unwind entries must land on a function start; "
+                            "this is what an un-re-based offset looks like.\n",
+                    (unsigned long long)addr[i], ns);
+            rc = -1;
+        }
+    }
+    free(starts); free(addr); free(kinds);
+    return rc;
 }
 
 /*
@@ -820,12 +913,12 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * refusal leaves it pristine. Silently shipping a binary whose constructors
      * or exports are `grow` bytes low is far worse than failing here. */
     if (mg_classify(buf) != 0) return -1;
-    if (mg_dice_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
+    if (mg_dice_walk(buf, fsize, grow, 0, 0, NULL, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: LC_DATA_IN_CODE is malformed or an entry offset would "
                         "overflow; refusing to grow\n");
         return -1;
     }
-    if (mg_unwind_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
+    if (mg_unwind_walk(buf, fsize, grow, 0, 0, NULL, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: __TEXT,__unwind_info is malformed, uses a layout this "
                         "does not understand, or an offset would overflow; refusing to grow\n");
         return -1;
@@ -835,7 +928,7 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         return -1;
     }
     {
-        int r = mg_trie_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0);
+        int r = mg_trie_walk(buf, fsize, grow, 0, 0, NULL, NULL, NULL, 0);
         if (r != 0) {
             fprintf(stderr, "macho_grow: export trie %s; refusing to grow.%s\n",
                     r > 0 ? "has an address whose ULEB encoding would widen, which would "
@@ -958,19 +1051,19 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * constructors did not move, so each offset must gain `grow`. Section file
      * offsets were bumped in the walk above, so these read from the new home.
      * The pre-mutation audit proved this cannot overflow. */
-    if (mg_trie_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+    if (mg_trie_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: internal error re-basing the export trie after passing "
                         "the pre-check\n");
         mg_snapshot_free(&snap);
         return -1;
     }
-    if (mg_dice_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+    if (mg_dice_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: internal error re-basing LC_DATA_IN_CODE after passing "
                         "the pre-check\n");
         mg_snapshot_free(&snap);
         return -1;
     }
-    if (mg_unwind_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+    if (mg_unwind_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: internal error re-basing __TEXT,__unwind_info after "
                         "passing the pre-check\n");
         mg_snapshot_free(&snap);
@@ -1010,6 +1103,17 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         return -1;
     }
     mg_snapshot_free(&snap);
+
+    /* And independently: do the results still name plausible targets? mg_verify
+     * proves nothing MOVED, which is silent about a structure we never collected.
+     * This asks a different question of the finished file -- do initializers and
+     * unwind entries still land on function starts -- so the two fail for
+     * different reasons. */
+    if (mg_plausible(buf, fsize + grow) != 0) {
+        fprintf(stderr, "macho_grow: the grown image does not pass its own plausibility "
+                        "check; refusing. Discard this buffer.\n");
+        return -1;
+    }
 
     *pfsize = fsize + grow;   /* *pbuf was set right after the realloc */
     return 0;

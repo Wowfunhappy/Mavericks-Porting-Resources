@@ -207,6 +207,8 @@ static void test_init_offsets_rebase(void) {
 #define MG_T_UNKNOWN_LC 8    /* a load command we have never classified */
 #define MG_T_LOH   16    /* LC_LINKER_OPTIMIZATION_HINT: base-relative, unhandled */
 #define MG_T_ODDSECT 32  /* a section whose TYPE we do not know */
+#define MG_T_FUNCSTARTS 64
+#define FS_OFF 7680
 #define TRIE_OFF    7168
 static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts) {
     const size_t fsize = 8192;
@@ -344,6 +346,18 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         lc2->cmdsize = sizeof *lc2;
         lc2->dataoff = 6656; lc2->datasize = 8;
         h->ncmds++; h->sizeofcmds += lc2->cmdsize; lcend += lc2->cmdsize;
+    }
+    if (opts & MG_T_FUNCSTARTS) {
+        struct linkedit_data_command *fc = (struct linkedit_data_command *)lcend;
+        fc->cmd = LC_FUNCTION_STARTS;
+        fc->cmdsize = sizeof *fc;
+        fc->dataoff = FS_OFF; fc->datasize = 5;
+        h->ncmds++; h->sizeofcmds += fc->cmdsize; lcend += fc->cmdsize;
+        /* ULEB deltas: first is from the image base. 0x1000 then +0x1000, so the
+         * function starts are base+0x1000 and base+0x2000 -- exactly where the
+         * two __init_offsets entries point. */
+        static const uint8_t fsb[5] = { 0x80, 0x20, 0x80, 0x20, 0x00 };
+        memcpy(buf + FS_OFF, fsb, sizeof fsb);
     }
     if (opts & MG_T_ODDSECT) sc->flags = 0x7e;   /* unknown SECTION_TYPE */
 
@@ -674,6 +688,47 @@ static void test_grow_refuses_unknown_section_type(void) {
     check_refused_unchanged("an unclassified section type", MG_T_ODDSECT);
 }
 
+/* ---- plausibility: verification without a "before" ----
+ * The invariant check is strictly stronger, but it needs a snapshot taken before
+ * the transform -- which the wrapper cannot have, because it verifies the end
+ * state of a pipeline whose earlier stages ran in other processes.
+ *
+ * This is the check that works from the finished file alone: initializers and
+ * compact-unwind entries name FUNCTIONS, so their targets must land exactly on
+ * an address LC_FUNCTION_STARTS lists. Measured on Claude Code 2.1.263 that
+ * holds perfectly -- 13/13 first-level, 198/198 LSDA, 9/9 initializers, against
+ * 71,974 known starts -- while a mere range check would be near-useless there,
+ * since __text is 63 MB and a one-page error stays inside it.
+ */
+static void test_plausible_accepts_a_well_formed_image(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_FUNCSTARTS);
+    CHECK(mg_plausible(buf, fsize) == 0,
+          "plausible ACCEPTS initializers that land on function starts");
+    free(buf);
+}
+
+static void test_plausible_rejects_an_offset_that_names_no_function(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_FUNCSTARTS);
+    uint32_t *e = (uint32_t *)(buf + sect_off);
+    e[0] += 0x10;              /* still inside __text, but not a function start */
+    CHECK(mg_plausible(buf, fsize) == -1,
+          "plausible REJECTS an initializer pointing into the middle of a function");
+    free(buf);
+}
+
+/* The failure this is really for: a structure left un-re-based by a grow. */
+static void test_plausible_rejects_an_unrebased_initializer(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_FUNCSTARTS);
+    uint32_t *e = (uint32_t *)(buf + sect_off);
+    e[0] -= 0x1000;            /* exactly what forgetting to re-base looks like */
+    CHECK(mg_plausible(buf, fsize) == -1,
+          "plausible REJECTS an initializer left a page low");
+    free(buf);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -690,6 +745,9 @@ int main(void) {
     test_grow_refuses_unknown_load_command();
     test_grow_refuses_linker_optimization_hint();
     test_grow_refuses_unknown_section_type();
+    test_plausible_accepts_a_well_formed_image();
+    test_plausible_rejects_an_offset_that_names_no_function();
+    test_plausible_rejects_an_unrebased_initializer();
     test_grow_rebases_unwind_info();
     test_verify_watches_unwind_info();
     test_verify_accepts_a_correct_grow();
