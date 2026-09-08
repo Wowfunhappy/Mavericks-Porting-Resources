@@ -10,6 +10,10 @@ standalone `modern_api_polyfills.c` (`__ulock_wait`, `kevent64`, the `dlopen`
 `.node` rewriter, the Terminal underline `write` shim, `posix_spawn` chdir, …),
 one shim per `src/*.c`.
 
+This also includes newer DNS-SD SPI compatibility: on Mavericks,
+`DNSServiceGetAddrInfoEx` delegates to `DNSServiceGetAddrInfo` and ignores the
+unsupported opaque `kDNSServiceAttrAllowFailover` attribute.
+
 > Historical note: there is no longer a separate `modern_api_polyfills.c` and no
 > `libMacportsLegacySupport.a`. Both were folded into `mavericks-legacy-support`.
 > If a binary reports a missing libSystem symbol, add it *there* (see that repo's

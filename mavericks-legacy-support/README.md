@@ -84,7 +84,10 @@ into three kinds:
   `src/posix_spawn_chdir.c`, `src/msg_x.c` (`recvmsg_x`/`sendmsg_x`),
   `src/preadv_pwritev_nocancel.c`, `src/renameatx_np.c`, `src/timingsafe_bcmp.c`,
   `src/fd_set_overflow.c`, `src/chk_fail.c`, `src/signpost.c`,
-  `src/os_unfair_lock_assert.c`, `src/pthread_self_is_exiting.c`.
+  `src/os_unfair_lock_assert.c`, `src/pthread_self_is_exiting.c`,
+  `src/dnssd_getaddrinfo_ex.c` (`DNSServiceGetAddrInfoEx` and its opaque
+  `kDNSServiceAttrAllowFailover` token, delegated to Mavericks'
+  `DNSServiceGetAddrInfo`).
 * **Behavioral overrides** — replace a symbol that *does* exist on 10.9 to fix
   broken/absent modern behavior: `src/kevent64_shim.c` (modern kqueue
   `KEVENT_FLAG_ERROR_EVENTS` / `EVFILT_MACHPORT` semantics, plus `socket`/
