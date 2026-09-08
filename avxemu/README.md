@@ -93,9 +93,14 @@ applying the SSE equivalent to the low and high halves (`HALFOP` in `exec.c`).
 Both the SIGILL and trampoline paths call the exact same `avxemu_emulate()`, so
 there is one emulation code path, not two.
 
-The dylib is loaded with `DYLD_INSERT_LIBRARIES` (the `claude` wrapper exports it
-only on CPUs that lack AVX2), so it is armed before the app's first AVX2
-instruction; the app itself needs no change.
+The dylib can be loaded either way. `DYLD_INSERT_LIBRARIES` is the zero-setup
+route, and dyld honours the `__DATA,__interpose` section for inserted images. A
+host that would rather not have every child process inherit the emulator links
+it into the Mach-O instead, with `change_dylib -insert` so that dyld initializes
+it ahead of every other dependency; on that path the dylib reproduces dyld's end
+state itself by rebinding the `sigaction`/`signal` symbol pointers of each loaded
+image (`AVXEMU_NO_REBIND=1` opts out). Either way it is armed before the app's
+first AVX2 instruction, and the app itself needs no change.
 
 > **Frontline handler.** Bun installs its own crash reporter on `SIGILL` during
 > startup. The dylib interposes `sigaction`/`signal`: a runtime's `SIGILL`
