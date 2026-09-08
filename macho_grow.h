@@ -562,6 +562,12 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
     uint8_t *nbuf = (uint8_t *)realloc(buf, fsize + grow);
     if (!nbuf) { fprintf(stderr, "macho_grow: realloc failed\n"); mg_snapshot_free(&snap); return -1; }
     buf = nbuf;
+    /* Hand the new pointer back IMMEDIATELY. realloc may have moved the block and
+     * freed the old one, so from here on the caller's *pbuf would otherwise be
+     * dangling on any failure return -- a double free waiting for whoever frees
+     * on error. The paths below are "cannot happen" assertions, which is exactly
+     * the kind of path that is never exercised until it is. */
+    *pbuf = buf;
     hdr = (struct mach_header_64 *)buf;
     memmove(buf + insert + grow, buf + insert, fsize - insert);
     memset(buf + insert, 0, grow);
@@ -680,15 +686,14 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * wrong, so this is the last chance to catch it. */
     if (mg_verify(buf, fsize + grow, &snap) != 0) {
         mg_snapshot_free(&snap);
-        /* The buffer has been transformed and is NOT safe to write. Hand it back
-         * so the caller can free it, but the nonzero return says: discard it. */
-        *pbuf = buf;
+        /* The buffer has been transformed and is NOT safe to write. *pbuf already
+         * points at it (set right after the realloc) so the caller can free it;
+         * the nonzero return says: discard it. */
         return -1;
     }
     mg_snapshot_free(&snap);
 
-    *pbuf = buf;
-    *pfsize = fsize + grow;
+    *pfsize = fsize + grow;   /* *pbuf was set right after the realloc */
     return 0;
 }
 
