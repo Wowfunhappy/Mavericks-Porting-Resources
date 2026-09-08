@@ -252,51 +252,6 @@ static int mg_trie_scan(const uint8_t *trie, uint32_t size, uint32_t off, int de
  * precondition (PIE-style __PAGEZERO large enough) isn't met — in which case
  * the buffer and size are left unchanged.
  */
-/*
- * Re-base the __TEXT,__init_offsets section.
- *
- * Newer toolchains replace the __mod_init_func pointer array with
- * __init_offsets: 32-bit offsets measured FROM THE MACH HEADER. Lowering the
- * image base by `grow` (what this file does to make header room) leaves those
- * offsets naming addresses `grow` bytes too low, so every initializer in the
- * list is called at the wrong address. Same failure class as the
- * LC_FUNCTION_STARTS leading delta, and just as invisible until something
- * actually runs the list. On 10.9 that something is
- * mavericks-legacy-support's init_offsets.c, since this dyld skips the
- * section entirely.
- *
- * Call AFTER the memmove and the load-command walk, so section `offset` fields
- * already point at the shifted data. Returns 0, or -1 if an entry would wrap.
- */
-static int mg_rebase_init_offsets(uint8_t *buf, uint32_t grow) {
-    struct mach_header_64 *hdr = (struct mach_header_64 *)buf;
-    uint8_t *lcp = buf + sizeof(*hdr);
-    for (uint32_t i = 0; i < hdr->ncmds; i++) {
-        struct load_command *lc = (struct load_command *)lcp;
-        if (lc->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)lcp;
-            struct section_64 *sect = (struct section_64 *)(lcp + sizeof(*seg));
-            for (uint32_t j = 0; j < seg->nsects; j++) {
-                if (strncmp(sect[j].sectname, "__init_offsets",
-                            sizeof(sect[j].sectname)) != 0)
-                    continue;
-                uint32_t n = (uint32_t)(sect[j].size / sizeof(uint32_t));
-                uint32_t *ents = (uint32_t *)(buf + sect[j].offset);
-                for (uint32_t k = 0; k < n; k++) {
-                    if (ents[k] > UINT32_MAX - grow) {
-                        fprintf(stderr, "macho_grow: __init_offsets entry %u would "
-                                        "overflow when re-based by %u\n", k, grow);
-                        return -1;
-                    }
-                    ents[k] += grow;
-                }
-            }
-        }
-        lcp += lc->cmdsize;
-    }
-    return 0;
-}
-
 static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
     uint8_t *buf = *pbuf;
     size_t fsize = *pfsize;
@@ -552,11 +507,6 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
             return -1;
         }
     }
-
-    /* Same story for __TEXT,__init_offsets, whose entries are offsets from the
-     * mach header rather than pointers: the base dropped, so each must gain
-     * `grow` to keep naming the same initializer. */
-    if (mg_rebase_init_offsets(buf, grow) != 0) return -1;
 
     *pbuf = buf;
     *pfsize = fsize + grow;
