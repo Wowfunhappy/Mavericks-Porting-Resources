@@ -447,7 +447,14 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
 
     if (idxCnt < 1) return -1;
     if ((uint64_t)idxOff + 12ull * idxCnt > usz) return -1;
-    for (uint32_t k = 0; k < idxCnt; k++) UW_VISIT(idxOff + 12 * k, MG_K_FUNC); /* incl. sentinel */
+    /* The LAST first-level entry is the sentinel: its functionOffset marks the END
+     * of the final function, not the start of one, so it is not required to appear
+     * in LC_FUNCTION_STARTS. It still needs re-basing like the rest. (It happens to
+     * coincide with a function start on Claude Code 2.1.263 -- 13/13 -- which is
+     * exactly the sort of single-sample coincidence that makes a wrong rule look
+     * right; a small dylib in change_dylib_test.sh disproved it.) */
+    for (uint32_t k = 0; k < idxCnt; k++)
+        UW_VISIT(idxOff + 12 * k, (k + 1 == idxCnt) ? MG_K_ANY : MG_K_FUNC);
 
     /* The last first-level entry is the sentinel: it has no page, and its lsda
      * offset marks the end of the previous entry's LSDA array. */

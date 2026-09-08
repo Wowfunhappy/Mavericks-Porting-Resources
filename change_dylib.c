@@ -689,6 +689,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* Last gate before the bytes reach disk. change_dylib is the FINAL stage of
+     * the wrapper's chain (patch_macho -> add_version_min -> change_dylib), so a
+     * check here covers the cumulative end state of all of them -- including
+     * patch_macho's chained-fixups conversion, which has ~94,900 rebases and no
+     * self-check of its own. It needs no "before" image, which is what makes it
+     * usable across process boundaries.
+     *
+     * This is the difference between "binary replaced, re-download that version"
+     * and "patch refused, nothing lost". MACHO_NO_VERIFY=1 opts out. */
+    if (!getenv("MACHO_NO_VERIFY") && mg_plausible(buf, fsize) != 0) {
+        fprintf(stderr, "ERROR: refusing to write %s -- it would carry base-relative "
+                        "offsets that name no known function. Left unmodified.\n", path);
+        return 1;
+    }
+
     if (ftruncate(fd, fsize) != 0) { perror("ftruncate"); return 1; }
     lseek(fd, 0, SEEK_SET);
     if (write(fd, buf, fsize) != (ssize_t)fsize) { perror("write"); return 1; }
