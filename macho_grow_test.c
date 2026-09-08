@@ -341,6 +341,58 @@ static void test_grow_refuses_unwind_info(void) {
     check_refused_unchanged("__TEXT,__unwind_info", MG_T_UNWIND);
 }
 
+/* ---- mg_verify: the grow must move nothing ----
+ * The invariant is not "the entries changed by grow", it is "the RESOLVED
+ * addresses did not change". Stating it that way is what makes the check catch
+ * bugs it was not written for: a handler that never ran, one that ran twice
+ * (PR #10 -- two correct __init_offsets re-basers met in a merge and composed
+ * into 2*grow), or one that ran with the wrong delta all look the same to it.
+ *
+ * The two failing cases below are the point. A verify that cannot fail is not a
+ * verify, so each one perturbs the grown image by exactly one handler's worth of
+ * work and asserts mg_verify rejects it.
+ */
+static void test_verify_accepts_a_correct_grow(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_growable_image(&fsize, &sect_off);
+    mg_snapshot snap;
+    CHECK(mg_snapshot_take(buf, fsize, &snap) == 0, "snapshot taken before the grow");
+    CHECK(snap.n == 2, "snapshot found both __init_offsets entries (got %u)", snap.n);
+
+    int r = mg_grow_header(&buf, &fsize, 0x1000);
+    CHECK(r == 0, "grow succeeds (got %d)", r);
+    if (r == 0)
+        CHECK(mg_verify(buf, fsize, &snap) == 0, "verify ACCEPTS a correct grow");
+    mg_snapshot_free(&snap);
+    free(buf);
+}
+
+/* Perturb every __init_offsets entry by `delta` after a correct grow, then
+ * demand mg_verify notices. delta=+grow is the double-apply; -grow is a handler
+ * that never ran. */
+static void check_verify_rejects(const char *what, int32_t delta) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_growable_image(&fsize, &sect_off);
+    mg_snapshot snap;
+    if (mg_snapshot_take(buf, fsize, &snap) != 0) { free(buf); CHECK(0, "%s: snapshot", what); return; }
+    if (mg_grow_header(&buf, &fsize, 0x1000) != 0) {
+        mg_snapshot_free(&snap); free(buf); CHECK(0, "%s: grow", what); return;
+    }
+    uint32_t *e = find_init_offsets(buf);
+    if (e) { e[0] = (uint32_t)(e[0] + delta); e[1] = (uint32_t)(e[1] + delta); }
+    CHECK(mg_verify(buf, fsize, &snap) == -1, "verify REJECTS %s", what);
+    mg_snapshot_free(&snap);
+    free(buf);
+}
+
+static void test_verify_rejects_double_apply(void) {
+    check_verify_rejects("a double-applied re-base (the PR #10 defect)", 0x1000);
+}
+
+static void test_verify_rejects_handler_that_never_ran(void) {
+    check_verify_rejects("a handler that never ran", -0x1000);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -354,6 +406,9 @@ int main(void) {
     test_grow_applies_init_offsets_once();
     test_grow_refuses_data_in_code();
     test_grow_refuses_unwind_info();
+    test_verify_accepts_a_correct_grow();
+    test_verify_rejects_double_apply();
+    test_verify_rejects_handler_that_never_ran();
     if (fails) { printf("macho_grow_test: %d FAILURE(S)\n", fails); return 1; }
     printf("macho_grow_test: all cases pass\n");
     return 0;

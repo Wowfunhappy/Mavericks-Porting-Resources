@@ -293,6 +293,111 @@ static int mg_audit_unrebased(const uint8_t *buf) {
     return 0;
 }
 
+/* ---- verification: prove the grow moved nothing ---------------------------
+ * Every structure below stores an offset FROM THE IMAGE BASE, so lowering the
+ * base by `grow` must leave the RESOLVED address (base + offset) unchanged.
+ * Snapshot those resolved addresses before the transform, recompute them after,
+ * and compare. That catches a handler that did not run, one that ran twice, and
+ * one that ran with the wrong delta -- without needing to know which.
+ *
+ * mg_collect walks the base-relative structures in load-command order, which is
+ * deterministic and identical before and after, so element i means the same
+ * thing in both snapshots. */
+typedef struct { uint64_t *addr; uint32_t n; } mg_snapshot;
+
+#define MG_SNAP_MAX 65536
+
+static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t max,
+                      uint32_t *n_out) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    uint64_t base = 0;
+    uint32_t n = 0;
+    /* image base first: __TEXT is the segment mapping the header (fileoff 0, has content) */
+    const uint8_t *q = sp;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)q;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)q;
+            if (seg->fileoff == 0 && seg->filesize > 0) { base = seg->vmaddr; break; }
+        }
+        q += lc->cmdsize;
+    }
+    if (!base) return -1;
+
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_FUNCTION_STARTS) {
+            const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
+            if (d->datasize) {
+                if ((size_t)d->dataoff + d->datasize > fsize) return -1;
+                uint64_t d0;
+                if (mg_uleb_decode(buf + d->dataoff, buf + d->dataoff + d->datasize, &d0) == 0)
+                    return -1;
+                if (n >= max) return -1;
+                out[n++] = base + d0;
+            }
+        }
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
+            const struct section_64 *sect = (const struct section_64 *)(sp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                if ((sect[j].flags & SECTION_TYPE) != S_INIT_FUNC_OFFSETS) continue;
+                if ((size_t)sect[j].offset + sect[j].size > fsize) return -1;
+                const uint32_t *e = (const uint32_t *)(buf + sect[j].offset);
+                uint64_t cnt = sect[j].size / sizeof(uint32_t);
+                for (uint64_t k = 0; k < cnt; k++) {
+                    if (n >= max) return -1;
+                    out[n++] = base + e[k];
+                }
+            }
+        }
+        sp += lc->cmdsize;
+    }
+    *n_out = n;
+    return 0;
+}
+
+static int mg_snapshot_take(const uint8_t *buf, size_t fsize, mg_snapshot *s) {
+    s->addr = (uint64_t *)malloc(MG_SNAP_MAX * sizeof(uint64_t));
+    if (!s->addr) return -1;
+    if (mg_collect(buf, fsize, s->addr, MG_SNAP_MAX, &s->n) != 0) {
+        free(s->addr); s->addr = NULL; s->n = 0; return -1;
+    }
+    return 0;
+}
+
+static void mg_snapshot_free(mg_snapshot *s) { free(s->addr); s->addr = NULL; s->n = 0; }
+
+/* 0 if every base-relative structure resolves exactly where it did before the
+ * grow; -1 (with a message naming the first mismatch) otherwise. */
+static int mg_verify(const uint8_t *buf, size_t fsize, const mg_snapshot *before) {
+    uint64_t *now = (uint64_t *)malloc(MG_SNAP_MAX * sizeof(uint64_t));
+    if (!now) return -1;
+    uint32_t n = 0;
+    if (mg_collect(buf, fsize, now, MG_SNAP_MAX, &n) != 0) {
+        fprintf(stderr, "macho_grow: verify could not re-read the base-relative structures\n");
+        free(now); return -1;
+    }
+    if (n != before->n) {
+        fprintf(stderr, "macho_grow: verify found %u base-relative entries, %u before -- "
+                        "the grow added or dropped one\n", n, before->n);
+        free(now); return -1;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (now[i] == before->addr[i]) continue;
+        int64_t moved = (int64_t)(now[i] - before->addr[i]);
+        fprintf(stderr, "macho_grow: verify FAILED -- base-relative entry %u resolved to "
+                        "%#llx before the grow and %#llx after (moved %+lld bytes). The grow "
+                        "must leave every resolved address unchanged; refusing.\n",
+                i, (unsigned long long)before->addr[i], (unsigned long long)now[i],
+                (long long)moved);
+        free(now); return -1;
+    }
+    free(now);
+    return 0;
+}
+
 /*
  * Grow the header pad by at least `grow_req` bytes (rounded up to a page).
  * pbuf is realloc'd, pfsize updated. Returns 0 on success, -1 if the
@@ -442,9 +547,20 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         }
     }
 
+    /* Phase 4 prep: snapshot every base-relative resolved address BEFORE touching
+     * a byte, so the verify at the end has something to prove against. If we
+     * cannot read them we cannot prove anything, so refuse rather than grow
+     * blind. */
+    mg_snapshot snap;
+    if (mg_snapshot_take(buf, fsize, &snap) != 0) {
+        fprintf(stderr, "macho_grow: could not snapshot the base-relative structures; "
+                        "refusing to grow without a way to verify the result\n");
+        return -1;
+    }
+
     /* Insert `grow` zero bytes after the load commands, shifting file data down. */
     uint8_t *nbuf = (uint8_t *)realloc(buf, fsize + grow);
-    if (!nbuf) { fprintf(stderr, "macho_grow: realloc failed\n"); return -1; }
+    if (!nbuf) { fprintf(stderr, "macho_grow: realloc failed\n"); mg_snapshot_free(&snap); return -1; }
     buf = nbuf;
     hdr = (struct mach_header_64 *)buf;
     memmove(buf + insert + grow, buf + insert, fsize - insert);
@@ -539,6 +655,7 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
     if (mg_init_offsets_pass(buf, fsize + grow, grow, 1) != 0) {
         fprintf(stderr, "macho_grow: internal error patching S_INIT_FUNC_OFFSETS after "
                         "passing the pre-check\n");
+        mg_snapshot_free(&snap);
         return -1;
     }
 
@@ -552,9 +669,23 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         if (r != 1) {
             fprintf(stderr, "macho_grow: internal error re-encoding function-starts "
                             "leading delta (r=%d) after passing the width pre-check\n", r);
+            mg_snapshot_free(&snap);
             return -1;
         }
     }
+
+    /* Phase 4: prove it. Every base-relative structure must resolve exactly where
+     * it did before. A mismatch means a handler did not run, ran twice, or ran
+     * with the wrong delta -- all of which produce a binary that loads and is
+     * wrong, so this is the last chance to catch it. */
+    if (mg_verify(buf, fsize + grow, &snap) != 0) {
+        mg_snapshot_free(&snap);
+        /* The buffer has been transformed and is NOT safe to write. Hand it back
+         * so the caller can free it, but the nonzero return says: discard it. */
+        *pbuf = buf;
+        return -1;
+    }
+    mg_snapshot_free(&snap);
 
     *pbuf = buf;
     *pfsize = fsize + grow;
