@@ -204,6 +204,9 @@ static void test_init_offsets_rebase(void) {
 #define MG_T_DICE   1
 #define MG_T_UNWIND 2
 #define MG_T_TRIE   4
+#define MG_T_UNKNOWN_LC 8    /* a load command we have never classified */
+#define MG_T_LOH   16    /* LC_LINKER_OPTIMIZATION_HINT: base-relative, unhandled */
+#define MG_T_ODDSECT 32  /* a section whose TYPE we do not know */
 #define TRIE_OFF    7168
 static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts) {
     const size_t fsize = 8192;
@@ -328,6 +331,21 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         };
         memcpy(buf + TRIE_OFF, trie, sizeof trie);
     }
+
+    if (opts & MG_T_UNKNOWN_LC) {
+        struct load_command *xc = (struct load_command *)lcend;
+        xc->cmd = 0x7fff;                 /* not a real load command */
+        xc->cmdsize = sizeof *xc;
+        h->ncmds++; h->sizeofcmds += xc->cmdsize; lcend += xc->cmdsize;
+    }
+    if (opts & MG_T_LOH) {
+        struct linkedit_data_command *lc2 = (struct linkedit_data_command *)lcend;
+        lc2->cmd = LC_LINKER_OPTIMIZATION_HINT;
+        lc2->cmdsize = sizeof *lc2;
+        lc2->dataoff = 6656; lc2->datasize = 8;
+        h->ncmds++; h->sizeofcmds += lc2->cmdsize; lcend += lc2->cmdsize;
+    }
+    if (opts & MG_T_ODDSECT) sc->flags = 0x7e;   /* unknown SECTION_TYPE */
 
     uint32_t *e = (uint32_t *)(buf + sc->offset);
     e[0] = 0x1000; e[1] = 0x2000;
@@ -634,6 +652,28 @@ static void test_grow_rebases_export_trie(void) {
     free(buf);
 }
 
+/* ---- unknown means unsafe ----
+ * The handlers above cover what we know. This is about what we do not: a load
+ * command or section type nobody classified might carry offsets from the image
+ * base exactly as __init_offsets and compact unwind do, and there is no way to
+ * tell by looking at a number. Growing anyway is how LC_DATA_IN_CODE and
+ * __unwind_info were silently corrupted for months. So the default is refusal,
+ * and adding support for something means adding it to the table on purpose.
+ */
+static void test_grow_refuses_unknown_load_command(void) {
+    check_refused_unchanged("an unclassified load command", MG_T_UNKNOWN_LC);
+}
+
+/* Known to carry base-relative ULEB payloads, and we do not re-base them.
+ * Refusing is the honest answer, not silence. */
+static void test_grow_refuses_linker_optimization_hint(void) {
+    check_refused_unchanged("LC_LINKER_OPTIMIZATION_HINT", MG_T_LOH);
+}
+
+static void test_grow_refuses_unknown_section_type(void) {
+    check_refused_unchanged("an unclassified section type", MG_T_ODDSECT);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -647,6 +687,9 @@ int main(void) {
     test_grow_applies_init_offsets_once();
     test_grow_rebases_data_in_code();
     test_grow_rebases_export_trie();
+    test_grow_refuses_unknown_load_command();
+    test_grow_refuses_linker_optimization_hint();
+    test_grow_refuses_unknown_section_type();
     test_grow_rebases_unwind_info();
     test_verify_watches_unwind_info();
     test_verify_accepts_a_correct_grow();

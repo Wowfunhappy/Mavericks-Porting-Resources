@@ -246,26 +246,6 @@ static int mg_trie_scan(const uint8_t *trie, uint32_t size, uint32_t off, int de
     return 0;
 }
 
-/* Refuse the base-relative structures we relocate but do not rewrite.
- *
- * LC_DATA_IN_CODE entry offsets and __TEXT,__unwind_info function offsets are
- * measured from the image base, exactly like __init_offsets and the
- * function-starts leading delta. Lowering the base leaves every one of them
- * `grow` bytes low. Neither is read at load time -- they surface during
- * exception unwinding, crash reporting and debugging -- so a grown binary looks
- * perfectly healthy and is not. That is the worst defect this code can ship, so
- * refuse until the re-basers exist rather than succeed silently.
- * Returns 0 if nothing unhandled is present, -1 (with a message) otherwise. */
-static int mg_audit_unrebased(const uint8_t *buf) {
-    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
-    const uint8_t *sp = buf + sizeof *h;
-    for (uint32_t i = 0; i < h->ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)sp;
-        sp += lc->cmdsize;
-    }
-    return 0;
-}
-
 /* Forward: mg_collect (below) needs the compact-unwind walker, which is defined
  * after it so its long explanation sits next to the grow it serves. */
 static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
@@ -609,6 +589,120 @@ static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
     return r;
 }
 
+/* ---- classification: unknown means unsafe ---------------------------------
+ * Lowering the image base is only safe if NOTHING in the file stores an offset
+ * measured from that base which we do not re-base. The handlers above cover the
+ * five structures we know about. This covers the ones we do not.
+ *
+ * A load command or section type nobody has classified may carry base-relative
+ * data exactly as __init_offsets and compact unwind do, and there is no way to
+ * tell from the number alone. Growing anyway is precisely how LC_DATA_IN_CODE
+ * and __TEXT,__unwind_info came to be silently corrupted. So: everything is
+ * enumerated on purpose, and anything unrecognised refuses.
+ *
+ * HONEST LIMIT: section classification is by TYPE, which describes how the
+ * contents are encoded, plus a by-NAME list of the S_REGULAR sections known to
+ * hold base-relative data (today just __unwind_info). A *new* S_REGULAR section
+ * carrying base-relative offsets would pass this check. Type covers the
+ * encoding families; the name list cannot cover what has not been invented.
+ * That residual risk is what the verify pass exists to narrow. */
+#ifndef LC_LAZY_LOAD_DYLIB
+#define LC_LAZY_LOAD_DYLIB 0x20
+#endif
+#ifndef LC_DYLD_ENVIRONMENT
+#define LC_DYLD_ENVIRONMENT 0x27
+#endif
+#ifndef LC_LINKER_OPTION
+#define LC_LINKER_OPTION 0x2D
+#endif
+#ifndef LC_NOTE
+#define LC_NOTE 0x31
+#endif
+#ifndef LC_BUILD_VERSION
+#define LC_BUILD_VERSION 0x32
+#endif
+#ifndef LC_FILESET_ENTRY
+#define LC_FILESET_ENTRY 0x80000035
+#endif
+#ifndef LC_ATOM_INFO
+#define LC_ATOM_INFO 0x36
+#endif
+#ifndef S_INIT_FUNC_OFFSETS
+#define S_INIT_FUNC_OFFSETS 0x16
+#endif
+
+static int mg_classify(const uint8_t *buf) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        const char *why = NULL;
+        switch (lc->cmd) {
+        /* Handled by a re-baser above. */
+        case LC_FUNCTION_STARTS: case LC_DATA_IN_CODE:
+        case LC_DYLD_INFO: case LC_DYLD_INFO_ONLY: case LC_DYLD_EXPORTS_TRIE:
+        case LC_SEGMENT_64:
+            break;
+
+        /* Inert under a base move: absolute addresses (which do not change),
+         * file offsets (shifted by the walk), indices, strings, or build metadata. */
+        case LC_SYMTAB: case LC_DYSYMTAB: case LC_UUID:
+        case LC_LOAD_DYLIB: case LC_ID_DYLIB: case LC_LOAD_WEAK_DYLIB:
+        case LC_REEXPORT_DYLIB: case LC_LAZY_LOAD_DYLIB: case LC_PREBOUND_DYLIB:
+        case LC_LOAD_DYLINKER: case LC_ID_DYLINKER: case LC_DYLD_ENVIRONMENT:
+        case LC_RPATH: case LC_MAIN: case LC_UNIXTHREAD: case LC_THREAD:
+        case LC_CODE_SIGNATURE: case LC_DYLIB_CODE_SIGN_DRS:
+        case LC_ENCRYPTION_INFO: case LC_ENCRYPTION_INFO_64:
+        case LC_VERSION_MIN_MACOSX: case LC_VERSION_MIN_IPHONEOS:
+        case LC_SOURCE_VERSION: case LC_BUILD_VERSION: case LC_LINKER_OPTION:
+        case LC_NOTE: case LC_SUB_FRAMEWORK: case LC_SUB_UMBRELLA:
+        case LC_SUB_CLIENT: case LC_SUB_LIBRARY: case LC_TWOLEVEL_HINTS:
+        case LC_PREBIND_CKSUM: case LC_ROUTINES_64: case LC_ATOM_INFO:
+            break;
+
+        /* Known to carry base-relative payloads we do NOT re-base. */
+        case LC_SEGMENT_SPLIT_INFO:
+            why = "LC_SEGMENT_SPLIT_INFO carries base-relative offsets that are not re-based";
+            break;
+        case LC_LINKER_OPTIMIZATION_HINT:
+            why = "LC_LINKER_OPTIMIZATION_HINT carries base-relative ULEB offsets that are "
+                  "not re-based";
+            break;
+        case LC_DYLD_CHAINED_FIXUPS:
+            why = "LC_DYLD_CHAINED_FIXUPS is not supported here; run patch_macho first to "
+                  "convert it to LC_DYLD_INFO_ONLY";
+            break;
+        default:
+            fprintf(stderr, "macho_grow: load command %#x is not classified, so it cannot be "
+                            "shown safe to grow past. Unknown means unsafe: it may hold "
+                            "offsets from the image base, as LC_DATA_IN_CODE does. Refusing.\n",
+                    lc->cmd);
+            return -1;
+        }
+        if (why) {
+            fprintf(stderr, "macho_grow: %s. Refusing to grow. Reclaim header bytes instead "
+                            "(change_dylib -strip-lc uuid -strip-lc codesig).\n", why);
+            return -1;
+        }
+
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
+            const struct section_64 *sect = (const struct section_64 *)(sp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                uint32_t type = sect[j].flags & SECTION_TYPE;
+                if (type > S_INIT_FUNC_OFFSETS) {
+                    fprintf(stderr, "macho_grow: %.16s,%.16s has section type %#x, which is not "
+                                    "classified; it may hold offsets from the image base. "
+                                    "Refusing.\n", sect[j].segname, sect[j].sectname, type);
+                    return -1;
+                }
+            }
+        }
+        sp += lc->cmdsize;
+    }
+    return 0;
+}
+
 /*
  * Grow the header pad by at least `grow_req` bytes (rounded up to a page).
  * pbuf is realloc'd, pfsize updated. Returns 0 on success, -1 if the
@@ -725,7 +819,7 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
     /* Audit the other base-relative structures before touching the buffer, so a
      * refusal leaves it pristine. Silently shipping a binary whose constructors
      * or exports are `grow` bytes low is far worse than failing here. */
-    if (mg_audit_unrebased(buf) != 0) return -1;
+    if (mg_classify(buf) != 0) return -1;
     if (mg_dice_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: LC_DATA_IN_CODE is malformed or an entry offset would "
                         "overflow; refusing to grow\n");
