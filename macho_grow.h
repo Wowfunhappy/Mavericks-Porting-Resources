@@ -272,6 +272,8 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
                           uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
 static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
                         uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
+static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
 
 /* ---- verification: prove the grow moved nothing ---------------------------
  * Every structure below stores an offset FROM THE IMAGE BASE, so lowering the
@@ -336,6 +338,7 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
     }
     /* Compact unwind last, so element order is stable across before/after. The
      * cast is safe: with `out` non-NULL the walker only reads. */
+    if (mg_trie_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     if (mg_dice_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     if (mg_unwind_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     *n_out = n;
@@ -512,6 +515,100 @@ static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
     return 0;
 }
 
+/* ---- export trie ----------------------------------------------------------
+ * Each exported address is a ULEB offset FROM THE IMAGE BASE, so lowering the
+ * base means every one must gain `grow`. The reason this is safe to do in place:
+ * adding a page never widens the encoding on a real binary. Measured across all
+ * 670 entries of Claude Code 2.1.263 at 4K, 8K and 16K grows, zero needed a
+ * wider ULEB and zero needed redundant padding. So each address is re-encoded at
+ * its ORIGINAL byte width, the trie keeps its size, and no __LINKEDIT offset
+ * moves. If one ever would widen, we refuse -- that is the case the old guard
+ * was written for, and it is still handled, just no longer assumed.
+ *
+ * Address 0 stays 0. That is __mh_execute_header, which names the header itself;
+ * the header moved down with the base, so 0 remains correct. It is therefore
+ * neither bumped nor collected -- its resolved address is base+0, which SHOULD
+ * change, and collecting it would make verify fail on a correct grow.
+ *
+ * `seen` guards a shared subtree from being bumped twice -- the same hazard as
+ * the __init_offsets double-apply. */
+static int mg_trie_node(uint8_t *trie, uint32_t size, uint32_t off, int depth,
+                        uint32_t grow, int patch, uint64_t base,
+                        uint64_t *out, uint32_t *n, uint32_t max, uint8_t *seen) {
+    if (depth > 128 || off >= size) return -1;
+    if (seen[off]) return 0;
+    seen[off] = 1;
+    uint8_t *p = trie + off, *end = trie + size;
+    uint64_t term; int k = mg_uleb_decode(p, end, &term);
+    if (k == 0) return -1;
+    p += k;
+    if (term) {
+        uint8_t *tend = p + term;
+        if (tend > end) return -1;
+        uint64_t flags; k = mg_uleb_decode(p, end, &flags);
+        if (k == 0) return -1;
+        p += k;
+        if (!(flags & MG_EXPORT_REEXPORT)) {          /* re-exports carry no address */
+            int rounds = (flags & MG_EXPORT_STUB_AND_RESOLVER) ? 2 : 1;
+            for (int r = 0; r < rounds; r++) {
+                uint64_t a; int w = mg_uleb_decode(p, end, &a);
+                if (w == 0) return -1;
+                if (a != 0) {
+                    if (out) {
+                        if (*n >= max) return -1;
+                        out[(*n)++] = base + a;
+                    } else {
+                        if (mg_uleb_minlen(a + grow) > w) return 1;   /* would widen */
+                        if (patch && !mg_uleb_encode_fixed(p, a + grow, w)) return 1;
+                    }
+                }
+                p += w;
+            }
+        }
+        p = tend;
+    }
+    if (p >= end) return -1;
+    uint8_t nch = *p++;
+    for (uint8_t i = 0; i < nch; i++) {
+        while (p < end && *p) p++;
+        if (p >= end) return -1;
+        p++;
+        uint64_t coff; k = mg_uleb_decode(p, end, &coff);
+        if (k == 0) return -1;
+        p += k;
+        int r = mg_trie_node(trie, size, (uint32_t)coff, depth + 1, grow, patch,
+                             base, out, n, max, seen);
+        if (r != 0) return r;
+    }
+    return 0;
+}
+
+static int mg_trie_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    uint32_t off = 0, size = 0;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) {
+            const struct dyld_info_command *d = (const struct dyld_info_command *)sp;
+            off = d->export_off; size = d->export_size; break;
+        }
+        if (lc->cmd == LC_DYLD_EXPORTS_TRIE) {
+            const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
+            off = d->dataoff; size = d->datasize; break;
+        }
+        sp += lc->cmdsize;
+    }
+    if (!off || !size) return 0;
+    if ((uint64_t)off + size > fsize) return -1;
+    uint8_t *seen = (uint8_t *)calloc(size, 1);
+    if (!seen) return -1;
+    int r = mg_trie_node(buf + off, size, 0, 0, grow, patch, base, out, n, max, seen);
+    free(seen);
+    return r;
+}
+
 /*
  * Grow the header pad by at least `grow_req` bytes (rounded up to a page).
  * pbuf is realloc'd, pfsize updated. Returns 0 on success, -1 if the
@@ -644,30 +741,15 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
         return -1;
     }
     {
-        uint32_t tr_off = 0, tr_size = 0;
-        const uint8_t *sp = buf + sizeof(*hdr);
-        for (uint32_t i = 0; i < hdr->ncmds; i++) {
-            const struct load_command *lc = (const struct load_command *)sp;
-            if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY) {
-                const struct dyld_info_command *d = (const struct dyld_info_command *)sp;
-                tr_off = d->export_off; tr_size = d->export_size; break;
-            }
-            if (lc->cmd == LC_DYLD_EXPORTS_TRIE) {
-                const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
-                tr_off = d->dataoff; tr_size = d->datasize; break;
-            }
-            sp += lc->cmdsize;
-        }
-        if (tr_off && tr_size) {
-            int r = mg_trie_scan(buf + tr_off, tr_size, 0, 0);
-            if (r != 0) {
-                fprintf(stderr, "macho_grow: export trie %s; its addresses are offsets from "
-                                "the image base and would need a ULEB re-encode that can "
-                                "resize __LINKEDIT, which is not implemented. Reclaim header "
-                                "bytes instead (change_dylib -strip-lc uuid -strip-lc codesig).\n",
-                        r > 0 ? "exports a nonzero address" : "is malformed");
-                return -1;
-            }
+        int r = mg_trie_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0);
+        if (r != 0) {
+            fprintf(stderr, "macho_grow: export trie %s; refusing to grow.%s\n",
+                    r > 0 ? "has an address whose ULEB encoding would widen, which would "
+                            "resize __LINKEDIT (not implemented)"
+                          : "is malformed",
+                    r > 0 ? " Reclaim header bytes instead (change_dylib -strip-lc uuid "
+                            "-strip-lc codesig)." : "");
+            return -1;
         }
     }
 
@@ -782,6 +864,12 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * constructors did not move, so each offset must gain `grow`. Section file
      * offsets were bumped in the walk above, so these read from the new home.
      * The pre-mutation audit proved this cannot overflow. */
+    if (mg_trie_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+        fprintf(stderr, "macho_grow: internal error re-basing the export trie after passing "
+                        "the pre-check\n");
+        mg_snapshot_free(&snap);
+        return -1;
+    }
     if (mg_dice_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: internal error re-basing LC_DATA_IN_CODE after passing "
                         "the pre-check\n");

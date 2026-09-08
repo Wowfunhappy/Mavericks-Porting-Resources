@@ -203,6 +203,8 @@ static void test_init_offsets_rebase(void) {
 
 #define MG_T_DICE   1
 #define MG_T_UNWIND 2
+#define MG_T_TRIE   4
+#define TRIE_OFF    7168
 static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts) {
     const size_t fsize = 8192;
     uint8_t *buf = (uint8_t *)calloc(1, fsize);
@@ -285,15 +287,15 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         UW32(buf, uw->offset, UW_ENT_OFF + 4)   = 0x00000040u | (2u << 24);
     }
 
+    uint8_t *lcend = (uint8_t *)tx + tx->cmdsize;
+
     if (opts & MG_T_DICE) {
-        struct linkedit_data_command *dc =
-            (struct linkedit_data_command *)((uint8_t *)tx + tx->cmdsize);
+        struct linkedit_data_command *dc = (struct linkedit_data_command *)lcend;
         dc->cmd = LC_DATA_IN_CODE;
         dc->cmdsize = sizeof *dc;
         dc->dataoff = 6144;
         dc->datasize = 16;       /* two 8-byte entries */
-        h->ncmds = 3;
-        h->sizeofcmds += dc->cmdsize;
+        h->ncmds++; h->sizeofcmds += dc->cmdsize; lcend += dc->cmdsize;
         /* two data_in_code_entry: { uint32 offset; uint16 length; uint16 kind }.
          * Only `offset` is base-relative; length and kind must survive intact. */
         UW32(buf, dc->dataoff, 0) = 0x1500;
@@ -302,6 +304,29 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         UW32(buf, dc->dataoff, 8) = 0x2500;
         *(uint16_t *)(buf + dc->dataoff + 12) = 0x40;
         *(uint16_t *)(buf + dc->dataoff + 14) = 4;
+    }
+
+    if (opts & MG_T_TRIE) {
+        struct dyld_info_command *di = (struct dyld_info_command *)lcend;
+        di->cmd = LC_DYLD_INFO_ONLY;
+        di->cmdsize = sizeof *di;
+        di->export_off = TRIE_OFF;
+        di->export_size = 17;
+        h->ncmds++; h->sizeofcmds += di->cmdsize; lcend += di->cmdsize;
+
+        /* A hand-built export trie, 17 bytes:
+         *   root: no terminal, two children "A" -> 8, "B" -> 13
+         *   node A: terminal, flags 0, address 0x1000 (2-byte ULEB)
+         *   node B: terminal, flags 0, address 0 -- the __mh_execute_header
+         *           case, which names the header and must STAY 0. */
+        static const uint8_t trie[17] = {
+            0x00, 0x02,
+            'A', 0x00, 8,
+            'B', 0x00, 13,
+            0x03, 0x00, 0x80, 0x20, 0x00,     /* A: termsz 3, flags 0, addr 0x1000, 0 kids */
+            0x02, 0x00, 0x00, 0x00            /* B: termsz 2, flags 0, addr 0,      0 kids */
+        };
+        memcpy(buf + TRIE_OFF, trie, sizeof trie);
     }
 
     uint32_t *e = (uint32_t *)(buf + sc->offset);
@@ -554,6 +579,61 @@ static void test_verify_watches_unwind_info(void) {
     free(buf);
 }
 
+/* The export trie stores each address as a ULEB offset from the image base. The
+ * fix that makes this tractable: adding `grow` never widens the encoding on any
+ * real binary (measured across all 670 entries of Claude Code 2.1.263 at 4K, 8K
+ * and 16K), so the address is re-encoded at its ORIGINAL byte width and the trie
+ * -- and every __LINKEDIT offset after it -- keeps its size.
+ *
+ * __mh_execute_header is exported at 0 and must stay 0: it names the header,
+ * which moved down with the base, so 0 is still correct. */
+static uint8_t *find_trie(uint8_t *buf) {
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_DYLD_INFO_ONLY || lc->cmd == LC_DYLD_INFO)
+            return buf + ((struct dyld_info_command *)lcp)->export_off;
+        lcp += lc->cmdsize;
+    }
+    return NULL;
+}
+
+static uint32_t trie_size(uint8_t *buf) {
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_DYLD_INFO_ONLY || lc->cmd == LC_DYLD_INFO)
+            return ((struct dyld_info_command *)lcp)->export_size;
+        lcp += lc->cmdsize;
+    }
+    return 0;
+}
+
+static void test_grow_rebases_export_trie(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_TRIE);
+    const uint32_t g = 0x1000;
+
+    int r = mg_grow_header(&buf, &fsize, g);
+    CHECK(r == 0, "grow succeeds on an image with an export trie (got %d)", r);
+    if (r != 0) { free(buf); return; }
+
+    CHECK(trie_size(buf) == 17, "trie size UNCHANGED (got %u) -- no __LINKEDIT resize",
+          trie_size(buf));
+    uint8_t *t = find_trie(buf);
+    CHECK(t != NULL, "export trie still locatable");
+    if (!t) { free(buf); return; }
+    /* node A's address, still a 2-byte ULEB at the same place */
+    uint64_t a = 0; int n = mg_uleb_decode(t + 10, t + 17, &a);
+    CHECK(n == 2, "node A address still encoded in 2 bytes (got %d)", n);
+    CHECK(a == 0x1000 + g, "node A address gains grow: got %#llx want %#llx",
+          (unsigned long long)a, (unsigned long long)(0x1000 + g));
+    CHECK(t[15] == 0x00, "__mh_execute_header-style export STAYS 0 (got %#x)", t[15]);
+    free(buf);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -566,6 +646,7 @@ int main(void) {
     test_init_offsets_rebase();
     test_grow_applies_init_offsets_once();
     test_grow_rebases_data_in_code();
+    test_grow_rebases_export_trie();
     test_grow_rebases_unwind_info();
     test_verify_watches_unwind_info();
     test_verify_accepts_a_correct_grow();
