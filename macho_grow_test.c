@@ -189,7 +189,12 @@ static void test_init_offsets_rebase(void) {
  * Deliberately carries no LC_FUNCTION_STARTS and no export trie: both are
  * audited separately, and leaving them out keeps this about the one structure.
  */
-static uint8_t *build_growable_image(size_t *fsize_out, uint32_t *sect_off_out) {
+/* opts: MG_T_DICE adds an LC_DATA_IN_CODE whose entries are base-relative;
+ * MG_T_UNWIND adds a __TEXT,__unwind_info section. macho_grow rebases neither,
+ * so a grow of an image carrying either must refuse rather than corrupt it. */
+#define MG_T_DICE   1
+#define MG_T_UNWIND 2
+static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts) {
     const size_t fsize = 8192;
     uint8_t *buf = (uint8_t *)calloc(1, fsize);
 
@@ -210,13 +215,13 @@ static uint8_t *build_growable_image(size_t *fsize_out, uint32_t *sect_off_out) 
 
     struct segment_command_64 *tx = (struct segment_command_64 *)((uint8_t *)pz + pz->cmdsize);
     tx->cmd = LC_SEGMENT_64;
-    tx->cmdsize = sizeof *tx + sizeof(struct section_64);
+    tx->cmdsize = sizeof *tx + (opts & MG_T_UNWIND ? 2 : 1) * sizeof(struct section_64);
     strcpy(tx->segname, "__TEXT");
     tx->vmaddr = 0x100000000ull;
     tx->vmsize = fsize;
     tx->fileoff = 0;
     tx->filesize = fsize;
-    tx->nsects = 1;
+    tx->nsects = (opts & MG_T_UNWIND) ? 2 : 1;
 
     struct section_64 *sc = (struct section_64 *)((uint8_t *)tx + sizeof *tx);
     strncpy(sc->sectname, "__init_offsets", sizeof sc->sectname);
@@ -228,12 +233,39 @@ static uint8_t *build_growable_image(size_t *fsize_out, uint32_t *sect_off_out) 
 
     h->sizeofcmds = (uint32_t)(pz->cmdsize + tx->cmdsize);
 
+    if (opts & MG_T_UNWIND) {
+        struct section_64 *uw = sc + 1;
+        strncpy(uw->sectname, "__unwind_info", sizeof uw->sectname);
+        strncpy(uw->segname,  "__TEXT",        sizeof uw->segname);
+        uw->addr = 0x100002000ull;
+        uw->size = 64;
+        uw->offset = 5120;
+        uw->flags = S_REGULAR;   /* the TYPE says nothing here; the NAME is what matters */
+    }
+
+    if (opts & MG_T_DICE) {
+        struct linkedit_data_command *dc =
+            (struct linkedit_data_command *)((uint8_t *)tx + tx->cmdsize);
+        dc->cmd = LC_DATA_IN_CODE;
+        dc->cmdsize = sizeof *dc;
+        dc->dataoff = 6144;
+        dc->datasize = 16;       /* two 8-byte entries */
+        h->ncmds = 3;
+        h->sizeofcmds += dc->cmdsize;
+        uint32_t *d = (uint32_t *)(buf + dc->dataoff);
+        d[0] = 0x1500; d[2] = 0x2500;   /* entry.offset, base-relative */
+    }
+
     uint32_t *e = (uint32_t *)(buf + sc->offset);
     e[0] = 0x1000; e[1] = 0x2000;
 
     *fsize_out = fsize;
     *sect_off_out = sc->offset;
     return buf;
+}
+
+static uint8_t *build_growable_image(size_t *fsize_out, uint32_t *sect_off_out) {
+    return build_image(fsize_out, sect_off_out, 0);
 }
 
 /* After a grow, find __init_offsets again -- its file offset moved with the data. */
@@ -274,6 +306,41 @@ static void test_grow_applies_init_offsets_once(void) {
     free(buf);
 }
 
+/* ---- refuse what we cannot rebase ----
+ * Both structures below store offsets from the image base, exactly like
+ * __init_offsets and the function-starts leading delta. macho_grow relocates
+ * LC_DATA_IN_CODE's blob but never rewrites the offsets inside it, and does not
+ * mention __unwind_info at all. Until handlers exist, growing such an image MUST
+ * fail: a silent success ships a binary whose data-in-code ranges and
+ * compact-unwind entries are all `grow` bytes low, which nothing notices until
+ * something unwinds. A refusal leaves the caller's buffer byte-identical.
+ */
+static void check_refused_unchanged(const char *what, int opts) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, opts);
+    size_t fsize0 = fsize;
+    uint8_t *before = (uint8_t *)malloc(fsize0);
+    memcpy(before, buf, fsize0);
+
+    int r = mg_grow_header(&buf, &fsize, 0x1000);
+    CHECK(r == -1, "%s: mg_grow_header refuses (got %d)", what, r);
+    CHECK(fsize == fsize0, "%s: size unchanged on refusal (got %zu want %zu)",
+          what, fsize, fsize0);
+    if (fsize == fsize0)
+        CHECK(memcmp(before, buf, fsize0) == 0,
+              "%s: buffer byte-identical on refusal", what);
+    free(before);
+    free(buf);
+}
+
+static void test_grow_refuses_data_in_code(void) {
+    check_refused_unchanged("LC_DATA_IN_CODE", MG_T_DICE);
+}
+
+static void test_grow_refuses_unwind_info(void) {
+    check_refused_unchanged("__TEXT,__unwind_info", MG_T_UNWIND);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -285,6 +352,8 @@ int main(void) {
     test_invariant_addresses_preserved();
     test_init_offsets_rebase();
     test_grow_applies_init_offsets_once();
+    test_grow_refuses_data_in_code();
+    test_grow_refuses_unwind_info();
     if (fails) { printf("macho_grow_test: %d FAILURE(S)\n", fails); return 1; }
     printf("macho_grow_test: all cases pass\n");
     return 0;

@@ -246,6 +246,53 @@ static int mg_trie_scan(const uint8_t *trie, uint32_t size, uint32_t off, int de
     return 0;
 }
 
+/* Refuse the base-relative structures we relocate but do not rewrite.
+ *
+ * LC_DATA_IN_CODE entry offsets and __TEXT,__unwind_info function offsets are
+ * measured from the image base, exactly like __init_offsets and the
+ * function-starts leading delta. Lowering the base leaves every one of them
+ * `grow` bytes low. Neither is read at load time -- they surface during
+ * exception unwinding, crash reporting and debugging -- so a grown binary looks
+ * perfectly healthy and is not. That is the worst defect this code can ship, so
+ * refuse until the re-basers exist rather than succeed silently.
+ * Returns 0 if nothing unhandled is present, -1 (with a message) otherwise. */
+static int mg_audit_unrebased(const uint8_t *buf) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_DATA_IN_CODE) {
+            const struct linkedit_data_command *d =
+                (const struct linkedit_data_command *)sp;
+            if (d->datasize) {
+                fprintf(stderr, "macho_grow: LC_DATA_IN_CODE holds %u entries whose offsets "
+                        "are measured from the image base; re-basing them is not implemented, "
+                        "so growing would leave every range low. Reclaim header bytes instead "
+                        "(change_dylib -strip-lc uuid -strip-lc codesig).\n",
+                        d->datasize / 8);
+                return -1;
+            }
+        }
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
+            const struct section_64 *sect = (const struct section_64 *)(sp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                if (sect[j].size &&
+                    strncmp(sect[j].sectname, "__unwind_info", sizeof sect[j].sectname) == 0) {
+                    fprintf(stderr, "macho_grow: %.16s,%.16s holds compact-unwind function "
+                            "offsets measured from the image base; re-basing them is not "
+                            "implemented, so growing would leave the unwind tables low. "
+                            "Reclaim header bytes instead (change_dylib -strip-lc uuid "
+                            "-strip-lc codesig).\n", sect[j].segname, sect[j].sectname);
+                    return -1;
+                }
+            }
+        }
+        sp += lc->cmdsize;
+    }
+    return 0;
+}
+
 /*
  * Grow the header pad by at least `grow_req` bytes (rounded up to a page).
  * pbuf is realloc'd, pfsize updated. Returns 0 on success, -1 if the
@@ -362,6 +409,7 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
     /* Audit the other base-relative structures before touching the buffer, so a
      * refusal leaves it pristine. Silently shipping a binary whose constructors
      * or exports are `grow` bytes low is far worse than failing here. */
+    if (mg_audit_unrebased(buf) != 0) return -1;
     if (mg_init_offsets_pass(buf, fsize, grow, 0) != 0) {
         fprintf(stderr, "macho_grow: malformed S_INIT_FUNC_OFFSETS section; refusing to grow\n");
         return -1;
