@@ -261,18 +261,6 @@ static int mg_audit_unrebased(const uint8_t *buf) {
     const uint8_t *sp = buf + sizeof *h;
     for (uint32_t i = 0; i < h->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)sp;
-        if (lc->cmd == LC_DATA_IN_CODE) {
-            const struct linkedit_data_command *d =
-                (const struct linkedit_data_command *)sp;
-            if (d->datasize) {
-                fprintf(stderr, "macho_grow: LC_DATA_IN_CODE holds %u entries whose offsets "
-                        "are measured from the image base; re-basing them is not implemented, "
-                        "so growing would leave every range low. Reclaim header bytes instead "
-                        "(change_dylib -strip-lc uuid -strip-lc codesig).\n",
-                        d->datasize / 8);
-                return -1;
-            }
-        }
         sp += lc->cmdsize;
     }
     return 0;
@@ -282,6 +270,8 @@ static int mg_audit_unrebased(const uint8_t *buf) {
  * after it so its long explanation sits next to the grow it serves. */
 static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
                           uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
+static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
 
 /* ---- verification: prove the grow moved nothing ---------------------------
  * Every structure below stores an offset FROM THE IMAGE BASE, so lowering the
@@ -346,6 +336,7 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
     }
     /* Compact unwind last, so element order is stable across before/after. The
      * cast is safe: with `out` non-NULL the walker only reads. */
+    if (mg_dice_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     if (mg_unwind_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     *n_out = n;
     return 0;
@@ -487,6 +478,40 @@ static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
     return 0;
 }
 
+/* ---- LC_DATA_IN_CODE ------------------------------------------------------
+ * A flat array of data_in_code_entry { uint32 offset; uint16 length; uint16 kind }.
+ * ONLY `offset` is measured from the image base. `length` and `kind` are not
+ * offsets at all, so a walker that bumps whole words instead of the first field
+ * of each entry corrupts every range while still "changing by grow".
+ * One walker, three uses, as for compact unwind. */
+static int mg_dice_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                        uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_DATA_IN_CODE) {
+            const struct linkedit_data_command *d = (const struct linkedit_data_command *)sp;
+            if (!d->datasize) return 0;
+            if ((uint64_t)d->dataoff + d->datasize > fsize) return -1;
+            if (d->datasize % 8) return -1;          /* not a whole number of entries */
+            uint8_t *e = buf + d->dataoff;
+            for (uint32_t k = 0; k < d->datasize; k += 8) {
+                if (out) {
+                    if (*n >= max) return -1;
+                    uint32_t v; memcpy(&v, e + k, sizeof v);
+                    out[(*n)++] = base + v;
+                } else if (mg_uw_bump(e + k, grow, patch) != 0) {
+                    return -1;
+                }
+            }
+            return 0;
+        }
+        sp += lc->cmdsize;
+    }
+    return 0;
+}
+
 /*
  * Grow the header pad by at least `grow_req` bytes (rounded up to a page).
  * pbuf is realloc'd, pfsize updated. Returns 0 on success, -1 if the
@@ -604,6 +629,11 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * refusal leaves it pristine. Silently shipping a binary whose constructors
      * or exports are `grow` bytes low is far worse than failing here. */
     if (mg_audit_unrebased(buf) != 0) return -1;
+    if (mg_dice_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
+        fprintf(stderr, "macho_grow: LC_DATA_IN_CODE is malformed or an entry offset would "
+                        "overflow; refusing to grow\n");
+        return -1;
+    }
     if (mg_unwind_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: __TEXT,__unwind_info is malformed, uses a layout this "
                         "does not understand, or an offset would overflow; refusing to grow\n");
@@ -752,6 +782,12 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * constructors did not move, so each offset must gain `grow`. Section file
      * offsets were bumped in the walk above, so these read from the new home.
      * The pre-mutation audit proved this cannot overflow. */
+    if (mg_dice_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+        fprintf(stderr, "macho_grow: internal error re-basing LC_DATA_IN_CODE after passing "
+                        "the pre-check\n");
+        mg_snapshot_free(&snap);
+        return -1;
+    }
     if (mg_unwind_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
         fprintf(stderr, "macho_grow: internal error re-basing __TEXT,__unwind_info after "
                         "passing the pre-check\n");

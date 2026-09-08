@@ -294,8 +294,14 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         dc->datasize = 16;       /* two 8-byte entries */
         h->ncmds = 3;
         h->sizeofcmds += dc->cmdsize;
-        uint32_t *d = (uint32_t *)(buf + dc->dataoff);
-        d[0] = 0x1500; d[2] = 0x2500;   /* entry.offset, base-relative */
+        /* two data_in_code_entry: { uint32 offset; uint16 length; uint16 kind }.
+         * Only `offset` is base-relative; length and kind must survive intact. */
+        UW32(buf, dc->dataoff, 0) = 0x1500;
+        *(uint16_t *)(buf + dc->dataoff +  4) = 0x20;
+        *(uint16_t *)(buf + dc->dataoff +  6) = 4;      /* DICE_KIND_JUMP_TABLE32 */
+        UW32(buf, dc->dataoff, 8) = 0x2500;
+        *(uint16_t *)(buf + dc->dataoff + 12) = 0x40;
+        *(uint16_t *)(buf + dc->dataoff + 14) = 4;
     }
 
     uint32_t *e = (uint32_t *)(buf + sc->offset);
@@ -375,8 +381,42 @@ static void check_refused_unchanged(const char *what, int opts) {
     free(buf);
 }
 
-static void test_grow_refuses_data_in_code(void) {
-    check_refused_unchanged("LC_DATA_IN_CODE", MG_T_DICE);
+static uint8_t *find_dice(uint8_t *buf) {
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_DATA_IN_CODE)
+            return buf + ((struct linkedit_data_command *)lcp)->dataoff;
+        lcp += lc->cmdsize;
+    }
+    return NULL;
+}
+
+/* Every entry's `offset` is measured from the image base; `length` and `kind`
+ * are not offsets at all. A handler that treats the entry as three bumpable
+ * words would pass a "did it change" test and corrupt every range. */
+static void test_grow_rebases_data_in_code(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_DICE);
+    const uint32_t g = 0x1000;
+
+    int r = mg_grow_header(&buf, &fsize, g);
+    CHECK(r == 0, "grow succeeds on an image with LC_DATA_IN_CODE (got %d)", r);
+    if (r != 0) { free(buf); return; }
+
+    uint8_t *d = find_dice(buf);
+    CHECK(d != NULL, "LC_DATA_IN_CODE still locatable after the grow");
+    if (!d) { free(buf); return; }
+    CHECK(*(uint32_t *)(d + 0) == 0x1500 + g, "entry 0 offset gains grow: got %#x",
+          *(uint32_t *)(d + 0));
+    CHECK(*(uint32_t *)(d + 8) == 0x2500 + g, "entry 1 offset gains grow: got %#x",
+          *(uint32_t *)(d + 8));
+    CHECK(*(uint16_t *)(d +  4) == 0x20 && *(uint16_t *)(d +  6) == 4,
+          "entry 0 length/kind UNTOUCHED");
+    CHECK(*(uint16_t *)(d + 12) == 0x40 && *(uint16_t *)(d + 14) == 4,
+          "entry 1 length/kind UNTOUCHED");
+    free(buf);
 }
 
 /* After a grow, __unwind_info's file offset moved with the data. */
@@ -525,7 +565,7 @@ int main(void) {
     test_invariant_addresses_preserved();
     test_init_offsets_rebase();
     test_grow_applies_init_offsets_once();
-    test_grow_refuses_data_in_code();
+    test_grow_rebases_data_in_code();
     test_grow_rebases_unwind_info();
     test_verify_watches_unwind_info();
     test_verify_accepts_a_correct_grow();
