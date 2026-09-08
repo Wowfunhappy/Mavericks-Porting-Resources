@@ -192,6 +192,15 @@ static void test_init_offsets_rebase(void) {
 /* opts: MG_T_DICE adds an LC_DATA_IN_CODE whose entries are base-relative;
  * MG_T_UNWIND adds a __TEXT,__unwind_info section. macho_grow rebases neither,
  * so a grow of an image carrying either must refuse rather than corrupt it. */
+/* offsets within the synthetic __unwind_info section */
+#define UW_PERS_OFF  28
+#define UW_IDX_OFF   32
+#define UW_LSDA_OFF  56
+#define UW_LSDA_END  64
+#define UW_PAGE_OFF  72
+#define UW_ENT_OFF   80
+#define UW32(b, secoff, off) (*(uint32_t *)((b) + (secoff) + (off)))
+
 #define MG_T_DICE   1
 #define MG_T_UNWIND 2
 static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts) {
@@ -238,9 +247,42 @@ static uint8_t *build_image(size_t *fsize_out, uint32_t *sect_off_out, int opts)
         strncpy(uw->sectname, "__unwind_info", sizeof uw->sectname);
         strncpy(uw->segname,  "__TEXT",        sizeof uw->segname);
         uw->addr = 0x100002000ull;
-        uw->size = 64;
+        uw->size = 128;
         uw->offset = 5120;
         uw->flags = S_REGULAR;   /* the TYPE says nothing here; the NAME is what matters */
+
+        /* A compact-unwind section with one of every field family, so the test
+         * can tell a handler that bumps the right things from one that bumps
+         * everything. Layout mirrors the real format. */
+        uint32_t *h32 = (uint32_t *)(buf + uw->offset);
+        h32[0] = 1;                 /* version */
+        h32[1] = 0;                 /* commonEncodingsArraySectionOffset */
+        h32[2] = 0;                 /* commonEncodingsArrayCount */
+        h32[3] = UW_PERS_OFF;       /* personalityArraySectionOffset */
+        h32[4] = 1;                 /* personalityArrayCount */
+        h32[5] = UW_IDX_OFF;        /* indexSectionOffset */
+        h32[6] = 2;                 /* indexCount (one real entry + the sentinel) */
+
+        UW32(buf, uw->offset, UW_PERS_OFF)      = 0x9000;   /* base-relative -> GOT */
+
+        UW32(buf, uw->offset, UW_IDX_OFF + 0)   = 0x1000;   /* functionOffset  BASE-REL */
+        UW32(buf, uw->offset, UW_IDX_OFF + 4)   = UW_PAGE_OFF; /* page   section-rel */
+        UW32(buf, uw->offset, UW_IDX_OFF + 8)   = UW_LSDA_OFF; /* lsda   section-rel */
+        UW32(buf, uw->offset, UW_IDX_OFF + 12)  = 0x8000;   /* sentinel fnOff  BASE-REL */
+        UW32(buf, uw->offset, UW_IDX_OFF + 16)  = 0;        /* sentinel has no page */
+        UW32(buf, uw->offset, UW_IDX_OFF + 20)  = UW_LSDA_END;
+
+        UW32(buf, uw->offset, UW_LSDA_OFF + 0)  = 0x1100;   /* lsda functionOffset BASE-REL */
+        UW32(buf, uw->offset, UW_LSDA_OFF + 4)  = 0x7000;   /* lsdaOffset          BASE-REL */
+
+        UW32(buf, uw->offset, UW_PAGE_OFF + 0)  = 3;        /* kind = COMPRESSED */
+        *(uint16_t *)(buf + uw->offset + UW_PAGE_OFF + 4) = 8;  /* entryPageOffset */
+        *(uint16_t *)(buf + uw->offset + UW_PAGE_OFF + 6) = 2;  /* entryCount */
+        /* Compressed entries: low 24 bits are a DELTA from this page's own
+         * first-level functionOffset. Invariant under a uniform bump -- bumping
+         * them is the silent corruption this test exists to catch. */
+        UW32(buf, uw->offset, UW_ENT_OFF + 0)   = 0x00000010u | (1u << 24);
+        UW32(buf, uw->offset, UW_ENT_OFF + 4)   = 0x00000040u | (2u << 24);
     }
 
     if (opts & MG_T_DICE) {
@@ -337,8 +379,62 @@ static void test_grow_refuses_data_in_code(void) {
     check_refused_unchanged("LC_DATA_IN_CODE", MG_T_DICE);
 }
 
-static void test_grow_refuses_unwind_info(void) {
-    check_refused_unchanged("__TEXT,__unwind_info", MG_T_UNWIND);
+/* After a grow, __unwind_info's file offset moved with the data. */
+static uint8_t *find_unwind(uint8_t *buf) {
+    struct mach_header_64 *h = (struct mach_header_64 *)buf;
+    uint8_t *lcp = buf + sizeof *h;
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)lcp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lcp;
+            struct section_64 *sect = (struct section_64 *)(lcp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++)
+                if (strncmp(sect[j].sectname, "__unwind_info", 16) == 0)
+                    return buf + sect[j].offset;
+        }
+        lcp += lc->cmdsize;
+    }
+    return NULL;
+}
+
+/* The handler must bump the four base-relative field families and leave the
+ * compressed second-level entries ALONE -- those are deltas from their own
+ * page's first-level functionOffset, so a uniform bump leaves them correct and
+ * bumping them corrupts the tables silently. */
+static void test_grow_rebases_unwind_info(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_UNWIND);
+    const uint32_t g = 0x1000;
+
+    int r = mg_grow_header(&buf, &fsize, g);
+    CHECK(r == 0, "grow succeeds on an image with __unwind_info (got %d)", r);
+    if (r != 0) { free(buf); return; }
+
+    uint8_t *u = find_unwind(buf);
+    CHECK(u != NULL, "__unwind_info still locatable after the grow");
+    if (!u) { free(buf); return; }
+    uint32_t *at = (uint32_t *)u;
+#define UW_IS(off, want, what) \
+    CHECK(*(uint32_t *)(u + (off)) == (uint32_t)(want), \
+          "%s: got %#x want %#x", what, *(uint32_t *)(u + (off)), (uint32_t)(want))
+
+    UW_IS(UW_PERS_OFF,      0x9000 + g, "personality entry gains grow");
+    UW_IS(UW_IDX_OFF + 0,   0x1000 + g, "first-level functionOffset gains grow");
+    UW_IS(UW_IDX_OFF + 12,  0x8000 + g, "sentinel functionOffset gains grow");
+    UW_IS(UW_LSDA_OFF + 0,  0x1100 + g, "LSDA functionOffset gains grow");
+    UW_IS(UW_LSDA_OFF + 4,  0x7000 + g, "LSDA lsdaOffset gains grow");
+
+    /* section-relative fields must NOT move */
+    UW_IS(UW_IDX_OFF + 4,  UW_PAGE_OFF, "page section-offset unchanged");
+    UW_IS(UW_IDX_OFF + 8,  UW_LSDA_OFF, "LSDA section-offset unchanged");
+    UW_IS(3 * 4,           UW_PERS_OFF, "personality section-offset unchanged");
+
+    /* THE trap: compressed entries are deltas and must be untouched */
+    UW_IS(UW_ENT_OFF + 0, 0x00000010u | (1u << 24), "compressed entry 0 UNTOUCHED");
+    UW_IS(UW_ENT_OFF + 4, 0x00000040u | (2u << 24), "compressed entry 1 UNTOUCHED");
+    (void)at;
+#undef UW_IS
+    free(buf);
 }
 
 /* ---- mg_verify: the grow must move nothing ----
@@ -393,6 +489,31 @@ static void test_verify_rejects_handler_that_never_ran(void) {
     check_verify_rejects("a handler that never ran", -0x1000);
 }
 
+/* Coverage, not just correctness: a handler is only as safe as verify's
+ * willingness to contradict it. If mg_collect ever stops walking compact unwind,
+ * the count assertion fails here rather than silently going unwatched. */
+static void test_verify_watches_unwind_info(void) {
+    size_t fsize; uint32_t sect_off;
+    uint8_t *buf = build_image(&fsize, &sect_off, MG_T_UNWIND);
+    mg_snapshot snap;
+    CHECK(mg_snapshot_take(buf, fsize, &snap) == 0, "snapshot with unwind taken");
+    /* 2 __init_offsets + 1 personality + 2 first-level (incl. sentinel)
+     * + 2 LSDA fields = 7. The compressed entries are deltas and must NOT
+     * be counted -- if they were, this would be 9. */
+    CHECK(snap.n == 7, "verify watches all 7 base-relative unwind+init fields (got %u)", snap.n);
+
+    if (mg_grow_header(&buf, &fsize, 0x1000) != 0) {
+        CHECK(0, "grow succeeded"); mg_snapshot_free(&snap); free(buf); return;
+    }
+    /* Perturb one unwind field the handler is responsible for. */
+    uint8_t *u = find_unwind(buf);
+    if (u) *(uint32_t *)(u + UW_IDX_OFF) += 4;
+    CHECK(mg_verify(buf, fsize, &snap) == -1,
+          "verify REJECTS a perturbed first-level functionOffset");
+    mg_snapshot_free(&snap);
+    free(buf);
+}
+
 int main(void) {
     test_uleb_decode();
     test_uleb_minlen();
@@ -405,7 +526,8 @@ int main(void) {
     test_init_offsets_rebase();
     test_grow_applies_init_offsets_once();
     test_grow_refuses_data_in_code();
-    test_grow_refuses_unwind_info();
+    test_grow_rebases_unwind_info();
+    test_verify_watches_unwind_info();
     test_verify_accepts_a_correct_grow();
     test_verify_rejects_double_apply();
     test_verify_rejects_handler_that_never_ran();

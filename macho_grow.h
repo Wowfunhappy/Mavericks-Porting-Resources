@@ -273,25 +273,15 @@ static int mg_audit_unrebased(const uint8_t *buf) {
                 return -1;
             }
         }
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
-            const struct section_64 *sect = (const struct section_64 *)(sp + sizeof *seg);
-            for (uint32_t j = 0; j < seg->nsects; j++) {
-                if (sect[j].size &&
-                    strncmp(sect[j].sectname, "__unwind_info", sizeof sect[j].sectname) == 0) {
-                    fprintf(stderr, "macho_grow: %.16s,%.16s holds compact-unwind function "
-                            "offsets measured from the image base; re-basing them is not "
-                            "implemented, so growing would leave the unwind tables low. "
-                            "Reclaim header bytes instead (change_dylib -strip-lc uuid "
-                            "-strip-lc codesig).\n", sect[j].segname, sect[j].sectname);
-                    return -1;
-                }
-            }
-        }
         sp += lc->cmdsize;
     }
     return 0;
 }
+
+/* Forward: mg_collect (below) needs the compact-unwind walker, which is defined
+ * after it so its long explanation sits next to the grow it serves. */
+static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                          uint64_t base, uint64_t *out, uint32_t *n, uint32_t max);
 
 /* ---- verification: prove the grow moved nothing ---------------------------
  * Every structure below stores an offset FROM THE IMAGE BASE, so lowering the
@@ -354,6 +344,9 @@ static int mg_collect(const uint8_t *buf, size_t fsize, uint64_t *out, uint32_t 
         }
         sp += lc->cmdsize;
     }
+    /* Compact unwind last, so element order is stable across before/after. The
+     * cast is safe: with `out` non-NULL the walker only reads. */
+    if (mg_unwind_walk((uint8_t *)buf, fsize, 0, 0, base, out, &n, max) != 0) return -1;
     *n_out = n;
     return 0;
 }
@@ -395,6 +388,102 @@ static int mg_verify(const uint8_t *buf, size_t fsize, const mg_snapshot *before
         free(now); return -1;
     }
     free(now);
+    return 0;
+}
+
+/* ---- __TEXT,__unwind_info -------------------------------------------------
+ * Compact unwind stores several different things as 32-bit words, and only some
+ * are measured from the image base. Getting that distinction wrong is silent:
+ * the tables still parse, and only an actual unwind notices.
+ *
+ * MUST gain `grow` (offsets from the image base):
+ *   - personality array entries (they address the routine's GOT slot)
+ *   - first-level index functionOffset, INCLUDING the trailing sentinel
+ *   - LSDA index entries: both functionOffset and lsdaOffset
+ *   - regular (kind 2) second-level page entry functionOffset
+ * MUST NOT be touched:
+ *   - compressed (kind 3) second-level entries. Their low 24 bits are a delta
+ *     from their own page's first-level functionOffset, which the bump above
+ *     already moved, so they are correct untouched and corrupt if bumped.
+ *   - every *SectionOffset field: those are offsets within this section.
+ *   - common encodings: encodings, not addresses.
+ *
+ * One walker, three uses -- audit (patch=0), apply (patch=1), collect for verify
+ * (out != NULL). Deliberately one function: the __init_offsets double-apply
+ * happened because two functions encoded the same knowledge and both ran. */
+static int mg_uw_bump(uint8_t *p, uint32_t grow, int patch) {
+    uint32_t v; memcpy(&v, p, sizeof v);
+    if (v > 0xffffffffu - grow) return -1;      /* would overflow the 32-bit field */
+    if (patch) { v += grow; memcpy(p, &v, sizeof v); }
+    return 0;
+}
+
+static int mg_unwind_walk(uint8_t *buf, size_t fsize, uint32_t grow, int patch,
+                          uint64_t base, uint64_t *out, uint32_t *n, uint32_t max) {
+    const struct mach_header_64 *h = (const struct mach_header_64 *)buf;
+    const uint8_t *sp = buf + sizeof *h;
+    uint8_t *u = NULL; uint32_t usz = 0;
+    for (uint32_t i = 0; i < h->ncmds && !u; i++) {
+        const struct load_command *lc = (const struct load_command *)sp;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)sp;
+            const struct section_64 *sect = (const struct section_64 *)(sp + sizeof *seg);
+            for (uint32_t j = 0; j < seg->nsects; j++) {
+                if (strncmp(sect[j].sectname, "__unwind_info", sizeof sect[j].sectname)) continue;
+                if (!sect[j].size) return 0;
+                if ((uint64_t)sect[j].offset + sect[j].size > fsize) return -1;
+                u = buf + sect[j].offset; usz = (uint32_t)sect[j].size; break;
+            }
+        }
+        sp += lc->cmdsize;
+    }
+    if (!u) return 0;                       /* no compact unwind: nothing to do */
+
+#define UW_RD(off) ({ uint32_t _v; memcpy(&_v, u + (off), sizeof _v); _v; })
+#define UW_VISIT(off) do {                                                     \
+        if (out) { if (*n >= max) return -1; out[(*n)++] = base + UW_RD(off); } \
+        else if (mg_uw_bump(u + (off), grow, patch) != 0) return -1;            \
+    } while (0)
+
+    if (usz < 28) return -1;
+    if (UW_RD(0) != 1) return -1;           /* unknown version -> refuse, do not guess */
+    uint32_t peOff = UW_RD(12), peCnt = UW_RD(16);
+    uint32_t idxOff = UW_RD(20), idxCnt = UW_RD(24);
+
+    if (peCnt) {
+        if ((uint64_t)peOff + 4ull * peCnt > usz) return -1;
+        for (uint32_t k = 0; k < peCnt; k++) UW_VISIT(peOff + 4 * k);
+    }
+
+    if (idxCnt < 1) return -1;
+    if ((uint64_t)idxOff + 12ull * idxCnt > usz) return -1;
+    for (uint32_t k = 0; k < idxCnt; k++) UW_VISIT(idxOff + 12 * k);   /* incl. sentinel */
+
+    /* The last first-level entry is the sentinel: it has no page, and its lsda
+     * offset marks the end of the previous entry's LSDA array. */
+    for (uint32_t k = 0; k + 1 < idxCnt; k++) {
+        uint32_t lo = UW_RD(idxOff + 12 * k + 8);
+        uint32_t hi = UW_RD(idxOff + 12 * (k + 1) + 8);
+        if (hi < lo || hi > usz) return -1;
+        for (uint32_t e = lo; e + 8 <= hi; e += 8) { UW_VISIT(e); UW_VISIT(e + 4); }
+    }
+
+    for (uint32_t k = 0; k + 1 < idxCnt; k++) {
+        uint32_t pg = UW_RD(idxOff + 12 * k + 4);
+        if (!pg) continue;
+        if ((uint64_t)pg + 8 > usz) return -1;
+        uint32_t kind = UW_RD(pg);
+        if (kind == 3) continue;            /* COMPRESSED: deltas, leave alone */
+        if (kind != 2) return -1;           /* unknown page kind -> refuse */
+        uint16_t epo, ec;
+        memcpy(&epo, u + pg + 4, sizeof epo);
+        memcpy(&ec,  u + pg + 6, sizeof ec);
+        uint64_t first = (uint64_t)pg + epo;
+        if (first + 8ull * ec > usz) return -1;
+        for (uint32_t e = 0; e < ec; e++) UW_VISIT((uint32_t)(first + 8ull * e));
+    }
+#undef UW_VISIT
+#undef UW_RD
     return 0;
 }
 
@@ -515,6 +604,11 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * refusal leaves it pristine. Silently shipping a binary whose constructors
      * or exports are `grow` bytes low is far worse than failing here. */
     if (mg_audit_unrebased(buf) != 0) return -1;
+    if (mg_unwind_walk(buf, fsize, grow, 0, 0, NULL, NULL, 0) != 0) {
+        fprintf(stderr, "macho_grow: __TEXT,__unwind_info is malformed, uses a layout this "
+                        "does not understand, or an offset would overflow; refusing to grow\n");
+        return -1;
+    }
     if (mg_init_offsets_pass(buf, fsize, grow, 0) != 0) {
         fprintf(stderr, "macho_grow: malformed S_INIT_FUNC_OFFSETS section; refusing to grow\n");
         return -1;
@@ -658,6 +752,12 @@ static int mg_grow_header(uint8_t **pbuf, size_t *pfsize, uint32_t grow_req) {
      * constructors did not move, so each offset must gain `grow`. Section file
      * offsets were bumped in the walk above, so these read from the new home.
      * The pre-mutation audit proved this cannot overflow. */
+    if (mg_unwind_walk(buf, fsize + grow, grow, 1, 0, NULL, NULL, 0) != 0) {
+        fprintf(stderr, "macho_grow: internal error re-basing __TEXT,__unwind_info after "
+                        "passing the pre-check\n");
+        mg_snapshot_free(&snap);
+        return -1;
+    }
     if (mg_init_offsets_pass(buf, fsize + grow, grow, 1) != 0) {
         fprintf(stderr, "macho_grow: internal error patching S_INIT_FUNC_OFFSETS after "
                         "passing the pre-check\n");
