@@ -136,6 +136,49 @@ else
     bad "-delete silent rebind" "got '$out' — bound to the wrong dylib"
 fi
 
+# --- 6. more operations than the option arrays hold must be refused ----------
+# Each option accumulates into a fixed-size array. Without a bounds check the
+# writes run off the end into whatever follows -- silently, because nothing
+# reads back a length. Only -strip-lc checked, so the rest could overflow.
+# One case per array, each one past its capacity.
+cap_case() {
+    desc=$1; shift
+    build_main "$T/main_cap"
+    if "$T/change_dylib" "$T/main_cap" "$@" >/dev/null 2>"$T/cap.err"; then
+        bad "$desc" "accepted more operations than the array holds"
+    elif grep -qi 'too many' "$T/cap.err"; then
+        ok "$desc"
+    else
+        bad "$desc" "refused, but without a 'too many' diagnostic: $(head -1 "$T/cap.err")"
+    fi
+}
+set -- ; i=0
+while [ $i -lt 33 ]; do set -- "$@" -add "@loader_path/libspare.dylib"; i=$((i+1)); done
+cap_case "-add beyond capacity is refused" "$@"
+set -- ; i=0
+while [ $i -lt 33 ]; do set -- "$@" -insert "@loader_path/libspare.dylib"; i=$((i+1)); done
+cap_case "-insert beyond capacity is refused" "$@"
+set -- ; i=0
+while [ $i -lt 33 ]; do set -- "$@" -change "@loader_path/liba.dylib" "@loader_path/libz.dylib"; i=$((i+1)); done
+cap_case "-change beyond capacity is refused" "$@"
+set -- ; i=0
+while [ $i -lt 33 ]; do set -- "$@" -add-rpath "/tmp/rp"; i=$((i+1)); done
+cap_case "-add-rpath beyond capacity is refused" "$@"
+set -- ; i=0
+while [ $i -lt 33 ]; do set -- "$@" -delete-rpath "/tmp/rp"; i=$((i+1)); done
+cap_case "-delete-rpath beyond capacity is refused" "$@"
+
+# Exactly at capacity must still be accepted -- a check one too eager would
+# silently halve what every caller can ask for.
+build_main "$T/main_atcap"
+set -- ; i=0
+while [ $i -lt 32 ]; do set -- "$@" -add "@loader_path/libspare.dylib"; i=$((i+1)); done
+if "$T/change_dylib" "$T/main_atcap" -grow "$@" >/dev/null 2>"$T/atcap.err"; then
+    ok "-add exactly at capacity is accepted"
+else
+    bad "-add at capacity" "refused at the cap: $(head -1 "$T/atcap.err")"
+fi
+
 echo
 [ "$fails" -eq 0 ] && { echo "change_dylib_test: all cases pass"; exit 0; }
 echo "change_dylib_test: $fails FAILED"; exit 1
